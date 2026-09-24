@@ -136,7 +136,7 @@ describe("buildSessionContext", () => {
 			];
 			const ctx = buildSessionContext(entries);
 
-			// The baseline marker precedes the summary and retained messages.
+			// A non-user-visible system marker pins the baseline at the new context boundary.
 			expect(ctx.messages).toHaveLength(6);
 			expect(ctx.messages[0]).toMatchObject({ role: "system", reasoningEffortBaseline: true });
 			expect((ctx.messages[1] as any).summary).toContain("Summary of first two turns");
@@ -157,7 +157,7 @@ describe("buildSessionContext", () => {
 
 			// Baseline marker + summary + all messages (1,2,4)
 			expect(ctx.messages).toHaveLength(5);
-			expect((ctx.messages[0] as any).reasoningEffortBaseline).toBe(true);
+			expect(ctx.messages[0]).toMatchObject({ role: "system", reasoningEffortBaseline: true });
 			expect((ctx.messages[1] as any).summary).toContain("Empty summary");
 		});
 
@@ -175,7 +175,7 @@ describe("buildSessionContext", () => {
 
 			// Should use the latest baseline marker and summary, keeping from 4
 			expect(ctx.messages).toHaveLength(5);
-			expect((ctx.messages[0] as any).reasoningEffortBaseline).toBe(true);
+			expect(ctx.messages[0]).toMatchObject({ role: "system", reasoningEffortBaseline: true });
 			expect((ctx.messages[1] as any).summary).toContain("Second summary");
 		});
 
@@ -277,6 +277,7 @@ describe("buildSessionContext", () => {
 			// Main path to 7: baseline marker + summary + kept(3,4) + after(6,7)
 			const ctxMain = buildSessionContext(entries, "7");
 			expect(ctxMain.messages).toHaveLength(6);
+			expect((ctxMain.messages[0] as any).reasoningEffortBaseline).toBe(true);
 			expect((ctxMain.messages[1] as any).summary).toContain("Compacted history");
 			expect((ctxMain.messages[2] as any).content).toBe("q2");
 			expect((ctxMain.messages[3] as any).content[0].text).toBe("r2");
