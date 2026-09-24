@@ -120,6 +120,12 @@ Attribution:
 
 For release preparation, publishing, verification, or recovery, load and follow [.pi/skills/release.md](.pi/skills/release.md).
 
+## Maintaining this upstream fork
+
+This repository tracks upstream Pi with a small StGit patch stack. Before updating, switch to `openai-native-controls` and read [PATCHES.md](PATCHES.md). Treat upstream as the source of truth. Before resolving a conflict, inspect the new upstream design and check whether it already provides some or all of the patch's behavior. Preserve the patch's intent in the new architecture; never mechanically restore the old diff. Prefer adapting or shrinking redundant code, and delete a fully obsolete patch after verifying behavior and tests. Keep OpenAI protocol details out of generic Pi core. Follow PATCHES.md for update/resume steps and run patch-specific tests after every rebase.
+
+Use `scripts/install-pi-gpt-6.sh` for the independent `pi-gpt-6` command; leave normal `pi` untouched. Users run `pi-gpt-6 update` to replay/build/validate/activate the fork. Runtime updates are local and never push either fork branch; publishing is an explicit maintainer action. Its installed release stays usable during source conflicts; `pi-gpt-6 update --agent` is explicit opt-in and runs the resolver from that installed release. See PATCHES.md for paths and behavior.
+
 ## User Override
 
 If the user's instructions conflict with any rule in this document, ask for explicit confirmation before overriding. Only then execute their instructions.

@@ -154,6 +154,44 @@ test("failed activation does not prune releases", () => {
 	}
 });
 
+test("build and validation failures leave the prior release set untouched", () => {
+	for (const failedCommand of ["run build", "run check"]) {
+		const root = mkdtempSync(join(tmpdir(), "pi-gpt-6-validation-failure-"));
+		try {
+			const repository = join(root, "repo");
+			mkdirSync(repository);
+			runGit(repository, ["init", "-b", "openai-native-controls"]);
+			runGit(repository, ["config", "user.email", "test@example.com"]);
+			runGit(repository, ["config", "user.name", "Test"]);
+			mkdirSync(join(repository, "scripts"));
+			writeFileSync(join(repository, "scripts", "update-from-upstream.sh"), "#!/bin/sh\nexit 0\n");
+			chmodSync(join(repository, "scripts", "update-from-upstream.sh"), 0o755);
+			writeFileSync(join(repository, "source.txt"), "clean source\n");
+			runGit(repository, ["add", "."]);
+			runGit(repository, ["commit", "-m", "source"]);
+			const home = join(root, "home");
+			const names = Array.from({ length: 8 }, (_, index) => makeRelease(home, `2026040100000${index}`));
+			const active = join(home, "releases", names[7]);
+			symlinkSync(active, join(home, "current"));
+			const bin = join(root, "bin");
+			mkdirSync(bin);
+			const fakeNpm = join(bin, "npm");
+			writeFileSync(fakeNpm, `#!/bin/sh\n[ \"$*\" = \"${failedCommand}\" ] && exit 1\nexit 0\n`);
+			chmodSync(fakeNpm, 0o755);
+			const result = spawnSync(process.execPath, [launcherScript, "update"], {
+				cwd: root,
+				encoding: "utf8",
+				env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, PI_GPT6_REPO: repository, PI_GPT6_HOME: home },
+			});
+			assert.notEqual(result.status, 0, failedCommand);
+			assert.equal(readlinkSync(join(home, "current")), active);
+			assert.deepEqual(new Set(readdirSync(join(home, "releases"))), new Set(names));
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}
+});
+
 test("normal update stops on conflict without invoking the agent and writes a repair prompt", () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-gpt-6-conflict-no-agent-"));
 	try {

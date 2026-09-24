@@ -6,6 +6,7 @@ import {
 	lstatSync,
 	readFileSync,
 	readdirSync,
+	readlinkSync,
 	mkdirSync,
 	mkdtempSync,
 	renameSync,
@@ -143,7 +144,7 @@ function pruneReleases(home = HOME) {
 		return [];
 	}
 
-	const releaseName = /^[a-f0-9]{12}-\\d{14}$/;
+	const releaseName = /^[a-f0-9]{12}-\d{14}$/;
 	const releases = readdirSync(releasesDir, { withFileTypes: true })
 		.filter((entry) => releaseName.test(entry.name) && entry.isDirectory())
 		.map((entry) => ({ name: entry.name, path: join(releasesDir, entry.name) }))

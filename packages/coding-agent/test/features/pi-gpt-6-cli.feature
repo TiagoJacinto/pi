@@ -28,3 +28,22 @@ Feature: pi-gpt-6 fork CLI
     Then the installed fork runs the resolver against the source checkout
     And the resolver does not activate or install a release
     And after successful repair the user is told to run "pi-gpt-6 update" again
+
+  Scenario: Keep conflict repair opt-in
+    Given a fork update has stopped on a patch conflict
+    When the user runs "pi-gpt-6 update" or "pi-gpt-6 update --all"
+    Then the update stops without invoking an agent
+    And a repair prompt is written for the user
+    And the installed release remains active
+
+  Scenario: Prune old releases only after successful activation
+    Given a working fork release and older releases are installed
+    When a new fork release passes validation and is activated
+    Then the active release and five newest previous releases are retained
+    And older release directories are removed
+    But build, validation, or activation failure leaves all prior releases untouched
+
+  Scenario: Runtime update does not publish fork branches
+    When the user runs "pi-gpt-6 update" or "pi-gpt-6 update --all"
+    Then upstream is fetched and the local patch stack is replayed
+    And neither origin/main nor origin/openai-native-controls is pushed
