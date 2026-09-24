@@ -125,6 +125,7 @@ export function toToolDeclaration(tool: Tool): Tool {
 		name: tool.name,
 		description: tool.description,
 		parameters: JSON.parse(JSON.stringify(tool.parameters)) as Tool["parameters"],
+		...(tool.async ? { async: true } : {}),
 		...(tool.constrainedSampling === undefined ? {} : { constrainedSampling: tool.constrainedSampling }),
 	};
 }

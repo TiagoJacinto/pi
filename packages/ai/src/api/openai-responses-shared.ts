@@ -129,6 +129,7 @@ export interface ConvertResponsesMessagesOptions {
 	supportsAdditionalTools?: boolean;
 	supportsToolSearch?: boolean;
 	toolOptions?: ConvertResponsesToolsOptions;
+	supportsReasoningEffortUpdates?: boolean;
 }
 
 export interface ConvertResponsesToolsOptions {
@@ -136,6 +137,7 @@ export interface ConvertResponsesToolsOptions {
 	supportsStrictMode?: boolean;
 	supportsOpenAIGrammarTools?: boolean;
 	toolSearchResult?: boolean;
+	supportsAsyncToolCalling?: boolean;
 }
 
 // =============================================================================
@@ -148,7 +150,10 @@ export function convertResponsesMessages<TApi extends Api>(
 	allowedToolCallProviders: ReadonlySet<string>,
 	options?: ConvertResponsesMessagesOptions,
 ): ResponseInput {
-	const normalizedContext = resolveTranscript(context, options?.supportsMidConvoSystemMessages);
+	const normalizedContext = resolveTranscript(
+		context,
+		options?.supportsMidConvoSystemMessages || options?.supportsReasoningEffortUpdates,
+	);
 	const messages: ResponseInput = [];
 
 	const normalizeIdPart = (part: string): string => {
@@ -225,6 +230,18 @@ export function convertResponsesMessages<TApi extends Api>(
 				if (text.length > 0) {
 					messages.push({ role: instructionRole, content: sanitizeSurrogates(text) });
 				}
+			}
+			if (options?.supportsReasoningEffortUpdates && msg.reasoningEffortUpdate) {
+				const mappedEffort = model.thinkingLevelMap?.[msg.reasoningEffortUpdate];
+				const effort = typeof mappedEffort === "string" ? mappedEffort : msg.reasoningEffortUpdate;
+				// SAFETY: configuration_update is a documented Responses input item missing from this SDK version's union.
+				const update = {
+					type: "configuration_update",
+					reasoning: { effort: effort === "off" ? "none" : effort },
+				} as unknown as ResponseInputItem;
+				if ((messages.at(-1) as { type?: string } | undefined)?.type === "configuration_update")
+					messages[messages.length - 1] = update;
+				else messages.push(update);
 			}
 		} else if (msg.role === "user") {
 			if (typeof msg.content === "string") {
@@ -370,6 +387,7 @@ export function convertResponsesTools(tools: readonly Tool[], options?: ConvertR
 				type: "custom",
 				name: tool.name,
 				description: tool.description,
+				...(options?.supportsAsyncToolCalling && tool.async ? { async: true } : {}),
 				format: {
 					type: "grammar",
 					syntax: grammar.format,
@@ -383,12 +401,14 @@ export function convertResponsesTools(tools: readonly Tool[], options?: ConvertR
 		const strict = constrainedStrict ?? defaultStrict;
 		const functionTool: Omit<Extract<OpenAITool, { type: "function" }>, "strict"> & {
 			strict?: Extract<OpenAITool, { type: "function" }>["strict"];
+			async?: boolean;
 		} = {
 			type: "function",
 			name: tool.name,
 			description: tool.description,
 			parameters: getJsonSchemaToolParameters(tool, strict === true) as Record<string, unknown>,
 			...(options?.toolSearchResult ? { defer_loading: true } : {}),
+			...(options?.supportsAsyncToolCalling && tool.async ? { async: true } : {}),
 		};
 		if (supportsStrictMode) {
 			functionTool.strict = strict;
@@ -600,6 +620,7 @@ export async function processResponsesStream<TApi extends Api>(
 	for await (const event of openaiStream) {
 		await options?.onProviderStreamEvent?.(event, model);
 		if (event.type === "response.created") {
+			if (output.responseId && output.responseId !== event.response.id) outputSlots.clear();
 			output.responseId = event.response.id;
 		} else if (event.type === "response.output_item.added") {
 			createSlot(event.output_index, event.item);
@@ -772,6 +793,7 @@ function mapStopReason(
 		case "completed":
 			return { stopReason: "stop" };
 		case "incomplete":
+			if (incompleteReason === "steered") return { stopReason: "stop" };
 			if (incompleteReason === "max_output_tokens") {
 				return { stopReason: "length" };
 			}

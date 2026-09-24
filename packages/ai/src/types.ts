@@ -523,6 +523,10 @@ export interface SystemMessage {
 	 * the original. Avoid integer-like names; JSON objects reorder those.
 	 */
 	sections?: Record<string, string | null>;
+	/** A provider-neutral reasoning effort change, serialized only by capable providers. */
+	reasoningEffortUpdate?: ModelThinkingLevel;
+	/** Starts a fresh cache/context window for provider reasoning-effort pinning. */
+	reasoningEffortBaseline?: boolean;
 	/** Complete definitions of tools that become available at this point. */
 	toolsAdded?: Tool[];
 	/** Tools that stop being available at this point. */
@@ -544,8 +548,14 @@ export interface AssistantMessage {
 	model: string;
 	responseModel?: string; // Concrete model reported by the provider when different from the requested `model`
 	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
-	/** Exact provider-native effort level used for this response. Absent for legacy or unmanaged responses. */
+	/** Exact request-level provider effort, which may be pinned across in-context updates. */
 	providerThinkingLevel?: string;
+	/** Pi-selected effort for this response, distinct from a cache-preserving request baseline. */
+	effectiveThinkingLevel?: ModelThinkingLevel;
+	/** Pi effort pinned at request level for the active compatible context window. */
+	reasoningEffortBaseline?: ModelThinkingLevel;
+	/** Context-window identity used to scope provider reasoning-effort baselines. */
+	providerContextWindow?: number;
 	diagnostics?: AssistantMessageDiagnostic[]; // Redacted provider/runtime diagnostics for failures and recoveries.
 	usage: Usage;
 	stopReason: StopReason;
@@ -677,10 +687,17 @@ export type ConstrainedSamplingConfig =
 			variants: GrammarVariants;
 	  };
 
+export interface ActiveResponseController {
+	/** Send user input to the currently active provider response. Return false when unsupported or rejected. */
+	steer(input: UserMessage): Promise<boolean>;
+}
+
 export interface Tool<TParameters extends TSchema = TSchema> {
 	name: string;
 	description: string;
 	parameters: TParameters;
+	/** Whether a provider that supports async tool calling may dispatch this tool before a response ends. */
+	async?: boolean;
 	constrainedSampling?: false | ConstrainedSamplingConfig;
 }
 
@@ -852,6 +869,12 @@ export interface OpenAIResponsesCompat {
 	supportsExplicitPromptCacheMode?: boolean;
 	/** Whether the provider accepts the `max_output_tokens` parameter. Some Codex-protocol gateways reject it. Default: true. */
 	supportsMaxOutputTokens?: boolean;
+	/** Whether this model supports Responses API async function/custom tools. Default: false. */
+	supportsAsyncToolCalling?: boolean;
+	/** Whether this model supports Responses API `response.steer` over WebSockets. Default: false. */
+	supportsNativeSteering?: boolean;
+	/** Whether this model supports cache-preserving Responses API reasoning updates. Default: false. */
+	supportsReasoningEffortUpdates?: boolean;
 }
 
 /** Compatibility settings for Anthropic Messages-compatible APIs. */

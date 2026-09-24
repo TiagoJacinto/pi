@@ -928,16 +928,22 @@ function applyOpenAIResponsesTranscriptMetadata(model: Model<Api>): void {
 	const isOpenAICodex = model.provider === "openai-codex" && model.api === "openai-codex-responses";
 	const isProxiedResponses =
 		OPENAI_RESPONSES_PROXY_PROVIDERS.has(model.provider) && model.api === "openai-responses";
-	if (
-		!(isOpenAIResponses || isOpenAICodex || isProxiedResponses) ||
-		!OPENAI_MID_CONVO_SYSTEM_MESSAGE_MODEL_IDS.has(model.id)
-	) {
-		return;
-	}
+	if (!(isOpenAIResponses || isOpenAICodex || isProxiedResponses)) return;
+	const supportsNewResponsesControls = isOpenAIResponses && model.id.startsWith("gpt-6");
+	if (!supportsNewResponsesControls && !OPENAI_MID_CONVO_SYSTEM_MESSAGE_MODEL_IDS.has(model.id)) return;
 	model.compat = {
 		...(model.compat as OpenAIResponsesCompat | undefined),
-		supportsMidConvoSystemMessages: true,
+		...(OPENAI_MID_CONVO_SYSTEM_MESSAGE_MODEL_IDS.has(model.id)
+			? { supportsMidConvoSystemMessages: true }
+			: {}),
 		...(isProxiedResponses ? { supportsAdditionalTools: true } : {}),
+		...(supportsNewResponsesControls
+			? {
+					supportsAsyncToolCalling: true,
+					supportsNativeSteering: true,
+					supportsReasoningEffortUpdates: true,
+				}
+			: {}),
 	};
 }
 

@@ -1,4 +1,4 @@
-import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
+import type { ActiveResponseController, AssistantMessage, AssistantMessageEvent } from "../types.ts";
 
 class FifoQueue<T> {
 	private incoming: T[] = [];
@@ -89,6 +89,8 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 }
 
 export class AssistantMessageEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
+	activeResponseController?: ActiveResponseController;
+
 	constructor() {
 		super(
 			(event) => event.type === "done" || event.type === "error",

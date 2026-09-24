@@ -1,11 +1,20 @@
 import OpenAI from "openai";
-import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
-import { clampThinkingLevel } from "../models.ts";
 import type {
+	ResponseCreateParamsStreaming,
+	ResponseInput,
+	ResponseStreamEvent,
+	ResponsesClientEvent,
+} from "openai/resources/responses/responses.js";
+import type { ResponsesWS } from "openai/resources/responses/ws";
+import { clampThinkingLevel } from "../models.ts";
+import { registerSessionResourceCleanup } from "../session-resources.ts";
+import type {
+	ActiveResponseController,
 	Api,
 	AssistantMessage,
 	CacheRetention,
 	Model,
+	ModelThinkingLevel,
 	OpenAIResponsesCompat,
 	ProviderEnv,
 	ProviderHeaders,
@@ -21,7 +30,7 @@ import { headersToRecord } from "../utils/headers.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
-import { getDeclaredTools, resolveTranscript, resolveTranscriptTools } from "../utils/transcript.ts";
+import { getDeclaredTools, normalizeContext, resolveTranscript, resolveTranscriptTools } from "../utils/transcript.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
@@ -77,7 +86,38 @@ function getCompat(model: Model<"openai-responses">): Required<OpenAIResponsesCo
 		supportsToolSearch: model.compat?.supportsToolSearch ?? false,
 		supportsExplicitPromptCacheMode: model.compat?.supportsExplicitPromptCacheMode ?? false,
 		supportsMaxOutputTokens: model.compat?.supportsMaxOutputTokens ?? true,
+		supportsAsyncToolCalling: model.compat?.supportsAsyncToolCalling ?? false,
+		supportsNativeSteering: model.compat?.supportsNativeSteering ?? false,
+		supportsReasoningEffortUpdates: model.compat?.supportsReasoningEffortUpdates ?? false,
 	};
+}
+
+function getReasoningEffortBaseline(
+	model: Model<"openai-responses">,
+	context: TranscriptContext,
+	selectedEffort: ModelThinkingLevel | undefined,
+): ModelThinkingLevel {
+	let pinnedEffort: OpenAIResponsesOptions["reasoningEffort"];
+	let baselineEstablished = false;
+	for (const message of context.messages) {
+		if (message.role === "system" && message.reasoningEffortBaseline) {
+			pinnedEffort = selectedEffort;
+			baselineEstablished = true;
+		}
+		if (
+			message.role === "assistant" &&
+			message.api === model.api &&
+			message.provider === model.provider &&
+			message.model === model.id &&
+			message.providerContextWindow === model.contextWindow &&
+			!baselineEstablished
+		) {
+			pinnedEffort ??= (message.reasoningEffortBaseline ?? message.effectiveThinkingLevel) as
+				| OpenAIResponsesOptions["reasoningEffort"]
+				| undefined;
+		}
+	}
+	return pinnedEffort ?? selectedEffort ?? "off";
 }
 
 function getPromptCacheRetention(
@@ -101,7 +141,7 @@ function getPromptCacheOptions(
 
 // OpenAI Responses-specific options
 export interface OpenAIResponsesOptions extends StreamOptions {
-	reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	reasoningEffort?: ModelThinkingLevel;
 	reasoningSummary?: "auto" | "detailed" | "concise" | null;
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
 	toolChoice?: ResponseCreateParamsStreaming["tool_choice"];
@@ -116,7 +156,11 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 	options?: OpenAIResponsesOptions,
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
-	const normalizedContext = resolveTranscript(context, getCompat(model).supportsMidConvoSystemMessages);
+	const compat = getCompat(model);
+	const normalizedContext = resolveTranscript(
+		context,
+		compat.supportsMidConvoSystemMessages || compat.supportsReasoningEffortUpdates,
+	);
 
 	// Start async processing
 	(async () => {
@@ -143,11 +187,12 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			const apiKey = getClientApiKey(model.provider, options?.apiKey, options?.headers);
 			const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
 			const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
-			const compat = getCompat(model);
 			const grammarToolInputProperties = createGrammarToolInputProperties(
 				getDeclaredTools(normalizedContext.messages),
 				compat.supportsOpenAIGrammarTools,
 			);
+			const useResponsesWebSocket =
+				(compat.supportsNativeSteering || compat.supportsAsyncToolCalling) && options?.transport !== "sse";
 			const client = createClient(
 				model,
 				normalizedContext,
@@ -155,34 +200,110 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				options?.headers,
 				options?.fetch,
 				cacheSessionId,
+				useResponsesWebSocket,
 			);
-			let params = buildParams(model, normalizedContext, options, compat, grammarToolInputProperties);
+			const selectedEffort = options?.reasoningEffort;
+			const requestEffort = compat.supportsReasoningEffortUpdates
+				? getReasoningEffortBaseline(model, normalizedContext, selectedEffort)
+				: selectedEffort;
+			let params = buildParams(
+				model,
+				normalizedContext,
+				{ ...options, reasoningEffort: requestEffort },
+				compat,
+				grammarToolInputProperties,
+			);
+			output.providerThinkingLevel = params.reasoning?.effort ?? requestEffort;
+			output.reasoningEffortBaseline = requestEffort as AssistantMessage["reasoningEffortBaseline"];
+			output.effectiveThinkingLevel = options?.reasoningEffort;
+			output.providerContextWindow = model.contextWindow;
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
 				params = nextParams as ResponseCreateParamsStreaming;
 			}
-			const requestOptions = {
-				...(options?.signal ? { signal: options.signal } : {}),
-				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
-				maxRetries: 0,
-			};
-			const { data: openaiStream, response } = await retryProviderRequest(
-				() => client.responses.create(params, requestOptions).withResponse(),
-				{
-					maxRetries: options?.maxRetries,
-					maxRetryDelayMs: options?.maxRetryDelayMs,
-					signal: options?.signal,
-				},
-			);
-			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
-			stream.push({ type: "start", partial: output });
-
-			await processResponsesStream(openaiStream, output, stream, model, {
-				onProviderStreamEvent: options?.onProviderStreamEvent,
-				serviceTier: options?.serviceTier,
-				grammarToolInputProperties,
-				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
-			});
+			if (useResponsesWebSocket) {
+				const cacheKey = options?.sessionId
+					? `${options.sessionId}\0${model.provider}\0${model.id}\0${model.contextWindow}`
+					: undefined;
+				let session = cacheKey ? openAIResponsesWebSocketSessions.get(cacheKey) : undefined;
+				if (session && session.baseUrl !== model.baseUrl) {
+					closeResponsesWebSocket(session.connection, "model endpoint changed");
+					openAIResponsesWebSocketSessions.delete(cacheKey!);
+					session = undefined;
+				}
+				if (!session) {
+					const { ResponsesWS } = await import("openai/resources/responses/ws");
+					session = {
+						connection: new ResponsesWS(client),
+						baseUrl: model.baseUrl,
+					};
+					if (cacheKey) openAIResponsesWebSocketSessions.set(cacheKey, session);
+				}
+				const activeSession = session;
+				try {
+					const steering = createResponsesSteeringController(activeSession.connection);
+					if (compat.supportsNativeSteering) stream.activeResponseController = steering.controller;
+					stream.push({ type: "start", partial: output });
+					const { stream: _stream, ...fullBody } = params;
+					const requestBody = buildOpenAIResponsesWebSocketRequest(
+						{ ...fullBody, input: (fullBody.input ?? []) as ResponseInput },
+						activeSession,
+					);
+					activeSession.connection.send({ type: "response.create", ...requestBody } as ResponsesClientEvent);
+					await processResponsesStream(
+						responsesWebSocketEvents(activeSession.connection, steering.state, activeSession),
+						output,
+						stream,
+						model,
+						{
+							onProviderStreamEvent: options?.onProviderStreamEvent,
+							serviceTier: options?.serviceTier,
+							grammarToolInputProperties,
+							applyServiceTierPricing: (usage, serviceTier) =>
+								applyServiceTierPricing(usage, serviceTier, model),
+						},
+					);
+					activeSession.lastRequestBody = { ...fullBody, input: (fullBody.input ?? []) as ResponseInput };
+					activeSession.lastResponseId = output.responseId;
+					activeSession.lastResponseItems = convertResponsesMessages(
+						model,
+						normalizeContext({ messages: [output] }),
+						OPENAI_TOOL_CALL_PROVIDERS,
+						{ includeSystemPrompt: false, grammarToolInputProperties },
+					).filter((item) => item.type !== "function_call_output" && item.type !== "custom_tool_call_output");
+				} catch (error) {
+					if (cacheKey && openAIResponsesWebSocketSessions.get(cacheKey) === activeSession) {
+						openAIResponsesWebSocketSessions.delete(cacheKey);
+					}
+					closeResponsesWebSocket(activeSession.connection, "response failed");
+					throw error;
+				} finally {
+					stream.activeResponseController = undefined;
+					if (!cacheKey) closeResponsesWebSocket(activeSession.connection, "response complete");
+				}
+			} else {
+				const requestOptions = {
+					...(options?.signal ? { signal: options.signal } : {}),
+					...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
+					maxRetries: 0,
+				};
+				const { data: openaiStream, response } = await retryProviderRequest(
+					() => client.responses.create(params, requestOptions).withResponse(),
+					{
+						maxRetries: options?.maxRetries,
+						maxRetryDelayMs: options?.maxRetryDelayMs,
+						signal: options?.signal,
+					},
+				);
+				await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+				stream.push({ type: "start", partial: output });
+				await processResponsesStream(openaiStream, output, stream, model, {
+					onProviderStreamEvent: options?.onProviderStreamEvent,
+					serviceTier: options?.serviceTier,
+					grammarToolInputProperties,
+					applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
+				});
+			}
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -237,6 +358,188 @@ export const streamSimple: StreamFunction<"openai-responses", SimpleStreamOption
 	} satisfies OpenAIResponsesOptions);
 };
 
+type OpenAIResponsesWebSocketRequest = Omit<
+	ResponseCreateParamsStreaming,
+	"stream" | "input" | "previous_response_id"
+> & {
+	input: ResponseInput;
+	previous_response_id?: string | null;
+};
+
+type OpenAIResponsesWebSocketSession = {
+	connection: ResponsesWS;
+	baseUrl: string;
+	lastRequestBody?: OpenAIResponsesWebSocketRequest;
+	lastResponseId?: string;
+	lastResponseItems?: ResponseInput;
+	acceptedSteerInputs?: ResponseInput[];
+};
+
+const openAIResponsesWebSocketSessions = new Map<string, OpenAIResponsesWebSocketSession>();
+
+function closeOpenAIResponsesWebSocketSessions(sessionId?: string): void {
+	for (const [key, session] of openAIResponsesWebSocketSessions) {
+		if (sessionId && !key.startsWith(`${sessionId}\0`)) continue;
+		closeResponsesWebSocket(session.connection, "session cleanup");
+		openAIResponsesWebSocketSessions.delete(key);
+	}
+}
+
+registerSessionResourceCleanup(closeOpenAIResponsesWebSocketSessions);
+
+function closeResponsesWebSocket(connection: ResponsesWS, reason: string): void {
+	try {
+		connection.close({ code: 1000, reason });
+	} catch {
+		// A provider may already have closed the socket after an interrupted response.
+	}
+}
+
+function buildOpenAIResponsesWebSocketRequest(
+	body: OpenAIResponsesWebSocketRequest,
+	session: OpenAIResponsesWebSocketSession,
+): OpenAIResponsesWebSocketRequest {
+	const previousBody = session.lastRequestBody;
+	const previousResponseId = session.lastResponseId;
+	const previousItems = session.lastResponseItems;
+	if (!previousBody || !previousResponseId || !previousItems) {
+		session.acceptedSteerInputs = [];
+		return body;
+	}
+
+	const withoutInput = ({
+		input: _input,
+		previous_response_id: _previous,
+		...rest
+	}: OpenAIResponsesWebSocketRequest) => JSON.stringify(rest);
+	if (withoutInput(body) !== withoutInput(previousBody)) {
+		session.acceptedSteerInputs = [];
+		return body;
+	}
+
+	const prefix = [...(previousBody.input ?? []), ...previousItems];
+	if (body.input.length < prefix.length) {
+		session.acceptedSteerInputs = [];
+		return body;
+	}
+	if (JSON.stringify(body.input.slice(0, prefix.length)) !== JSON.stringify(prefix)) {
+		session.acceptedSteerInputs = [];
+		return body;
+	}
+	const delta = body.input.slice(prefix.length);
+	const acceptedSteers = (session.acceptedSteerInputs ?? []).flatMap((input) =>
+		typeof input === "string" ? [] : input,
+	);
+	session.acceptedSteerInputs = [];
+	return {
+		...body,
+		previous_response_id: previousResponseId,
+		input: delta.filter((item) => !acceptedSteers.some((steer) => JSON.stringify(steer) === JSON.stringify(item))),
+	};
+}
+
+interface ResponsesSteeringState {
+	responseId?: string;
+	acceptedSteers: number;
+	waitingForToolOutput: boolean;
+	pendingAcks: Array<{ resolve: (accepted: boolean) => void; input: ResponseInput; sent: boolean }>;
+}
+
+function createResponsesSteeringController(connection: ResponsesWS): {
+	controller: ActiveResponseController;
+	state: ResponsesSteeringState;
+} {
+	const state: ResponsesSteeringState = {
+		acceptedSteers: 0,
+		waitingForToolOutput: false,
+		pendingAcks: [],
+	};
+	return {
+		state,
+		controller: {
+			steer(input) {
+				if (state.waitingForToolOutput) return Promise.resolve(false);
+				const content =
+					typeof input.content === "string"
+						? [{ type: "input_text", text: input.content }]
+						: input.content.map((item) =>
+								item.type === "text"
+									? { type: "input_text", text: item.text }
+									: {
+											type: "input_image",
+											detail: "auto",
+											image_url: `data:${item.mimeType};base64,${item.data}`,
+										},
+							);
+				const steeringInput = [{ role: "user", content }] as ResponseInput;
+				return new Promise((resolve) => {
+					state.pendingAcks.push({ resolve, input: steeringInput, sent: false });
+					if (state.responseId) sendPendingSteers(connection, state);
+				});
+			},
+		},
+	};
+}
+
+function sendPendingSteers(connection: ResponsesWS, state: ResponsesSteeringState): void {
+	if (!state.responseId) return;
+	for (const pending of state.pendingAcks) {
+		if (pending.sent) continue;
+		pending.sent = true;
+		try {
+			// SAFETY: response.steer is documented by the Responses WebSocket protocol but absent from this SDK version's client-event union.
+			connection.send({
+				type: "response.steer",
+				previous_response_id: state.responseId,
+				input: pending.input,
+			} as unknown as ResponsesClientEvent);
+		} catch {
+			state.pendingAcks.splice(state.pendingAcks.indexOf(pending), 1);
+			pending.resolve(false);
+		}
+	}
+}
+
+async function* responsesWebSocketEvents(
+	connection: ResponsesWS,
+	state: ResponsesSteeringState,
+	session: OpenAIResponsesWebSocketSession,
+): AsyncGenerator<ResponseStreamEvent> {
+	try {
+		for await (const message of connection.stream()) {
+			if (message.type === "error") throw message.error;
+			if (message.type !== "message") continue;
+			const event = message.message as unknown as {
+				type: string;
+				response?: { id?: string; status?: string; incomplete_details?: { reason?: string } };
+			};
+			if (event.type === "response.created" && event.response?.id) {
+				if (state.responseId && state.responseId !== event.response.id) state.acceptedSteers = 0;
+				state.responseId = event.response.id;
+				sendPendingSteers(connection, state);
+			} else if (event.type === "response.steer.accepted" || event.type === "response.steer.pending") {
+				state.acceptedSteers++;
+				if (event.type === "response.steer.pending") state.waitingForToolOutput = true;
+				const pending = state.pendingAcks.shift();
+				if (pending) {
+					pending.resolve(true);
+					session.acceptedSteerInputs ??= [];
+					session.acceptedSteerInputs.push(pending.input);
+				}
+			} else if (event.type === "response.steer.failed") {
+				state.pendingAcks.shift()?.resolve(false);
+			}
+			// SAFETY: WebSocket steering acknowledgements are Responses events not yet declared in the SDK event union.
+			yield message.message as ResponseStreamEvent;
+			if (event.type === "response.completed" || event.type === "response.incomplete") {
+				if (state.waitingForToolOutput || state.acceptedSteers === 0) return;
+			}
+		}
+	} finally {
+		for (const pending of state.pendingAcks.splice(0)) pending.resolve(false);
+	}
+}
+
 function createClient(
 	model: Model<"openai-responses">,
 	context: TranscriptContext,
@@ -244,9 +547,14 @@ function createClient(
 	optionsHeaders?: ProviderHeaders,
 	fetch?: typeof globalThis.fetch,
 	sessionId?: string,
+	useResponsesWebSocket = false,
 ) {
 	const compat = getCompat(model);
-	const headers: ProviderHeaders = { "User-Agent": getPiUserAgent(), ...model.headers };
+	const headers: ProviderHeaders = {
+		"User-Agent": getPiUserAgent(),
+		...(useResponsesWebSocket ? { "OpenAI-Beta": "responses_websockets=2026-02-06" } : {}),
+		...model.headers,
+	};
 	if (model.provider === "github-copilot") {
 		const hasImages = hasCopilotVisionInput(context.messages);
 		const copilotHeaders = buildCopilotDynamicHeaders({
@@ -297,12 +605,14 @@ function buildParams(
 	);
 	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, {
 		grammarToolInputProperties,
-		supportsMidConvoSystemMessages: compat.supportsMidConvoSystemMessages,
+		supportsMidConvoSystemMessages: compat.supportsMidConvoSystemMessages || compat.supportsReasoningEffortUpdates,
+		supportsReasoningEffortUpdates: compat.supportsReasoningEffortUpdates,
 		supportsAdditionalTools: compat.supportsAdditionalTools,
 		supportsToolSearch: compat.supportsToolSearch,
 		toolOptions: {
 			supportsStrictMode: compat.supportsStrictMode,
 			supportsOpenAIGrammarTools: compat.supportsOpenAIGrammarTools,
+			supportsAsyncToolCalling: compat.supportsAsyncToolCalling,
 		},
 	});
 
@@ -335,6 +645,7 @@ function buildParams(
 		params.tools = convertResponsesTools(transcriptTools.requestTools, {
 			supportsStrictMode: compat.supportsStrictMode,
 			supportsOpenAIGrammarTools: compat.supportsOpenAIGrammarTools,
+			supportsAsyncToolCalling: compat.supportsAsyncToolCalling,
 		});
 	}
 
@@ -345,7 +656,8 @@ function buildParams(
 	if (model.reasoning) {
 		if (options?.reasoningEffort || options?.reasoningSummary) {
 			const effort = options?.reasoningEffort
-				? (model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort)
+				? (model.thinkingLevelMap?.[options.reasoningEffort] ??
+					(options.reasoningEffort === "off" ? "none" : options.reasoningEffort))
 				: "medium";
 			params.reasoning = {
 				effort: effort as NonNullable<typeof params.reasoning>["effort"],
