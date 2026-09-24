@@ -477,6 +477,31 @@ describe("OpenAI Responses native controls serialization", () => {
 		});
 	});
 
+	it("omits async tool calling when the caller forces SSE", async () => {
+		capturedRequests.length = 0;
+		fakeWSState.instances.length = 0;
+		const model = { ...createModel(), compat: { supportsAsyncToolCalling: true } };
+		const tool = {
+			name: "work",
+			label: "Work",
+			description: "Do work",
+			parameters: { type: "object", properties: {} },
+			async: true,
+		} as unknown as Tool;
+		const response = stream(
+			model,
+			normalizeContext({ messages: [{ role: "user", content: "start", timestamp: 1 }], tools: [tool] }),
+			{ apiKey: "test", transport: "sse" },
+		);
+		for await (const _event of response) {
+			// Drain the HTTP stream.
+		}
+
+		expect(capturedRequests[0].tools).toMatchObject([{ name: "work" }]);
+		expect((capturedRequests[0].tools as Array<Record<string, unknown>>)[0]).not.toHaveProperty("async");
+		expect(fakeWSState.instances).toHaveLength(0);
+	});
+
 	it("serializes async function tools only when the capability and tool opt in", () => {
 		const tool = {
 			name: "read_file",

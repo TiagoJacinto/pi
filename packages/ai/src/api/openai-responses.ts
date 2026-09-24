@@ -612,7 +612,7 @@ function buildParams(
 		toolOptions: {
 			supportsStrictMode: compat.supportsStrictMode,
 			supportsOpenAIGrammarTools: compat.supportsOpenAIGrammarTools,
-			supportsAsyncToolCalling: compat.supportsAsyncToolCalling,
+			supportsAsyncToolCalling: compat.supportsAsyncToolCalling && options?.transport !== "sse",
 		},
 	});
 
@@ -645,7 +645,7 @@ function buildParams(
 		params.tools = convertResponsesTools(transcriptTools.requestTools, {
 			supportsStrictMode: compat.supportsStrictMode,
 			supportsOpenAIGrammarTools: compat.supportsOpenAIGrammarTools,
-			supportsAsyncToolCalling: compat.supportsAsyncToolCalling,
+			supportsAsyncToolCalling: compat.supportsAsyncToolCalling && options?.transport !== "sse",
 		});
 	}
 

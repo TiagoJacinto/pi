@@ -253,6 +253,7 @@ async function runLoop(
 							?.supportsAsyncToolCalling === true;
 					if (
 						!supportsAsync ||
+						config.transport === "sse" ||
 						!tool?.async ||
 						config.toolExecution === "sequential" ||
 						tool.executionMode === "sequential"
