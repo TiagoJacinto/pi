@@ -243,8 +243,8 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 					if (cacheKey) openAIResponsesWebSocketSessions.set(cacheKey, session);
 				}
 				const activeSession = session;
+				const steering = createResponsesSteeringController(activeSession.connection);
 				try {
-					const steering = createResponsesSteeringController(activeSession.connection);
 					if (compat.supportsNativeSteering) stream.activeResponseController = steering.controller;
 					stream.push({ type: "start", partial: output });
 					const { stream: _stream, ...fullBody } = params;
@@ -288,6 +288,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 					closeResponsesWebSocket(activeSession.connection, "response failed");
 					throw error;
 				} finally {
+					steering.deactivate();
 					stream.activeResponseController = undefined;
 					if (!cacheKey) closeResponsesWebSocket(activeSession.connection, "response complete");
 				}
@@ -454,7 +455,9 @@ function buildOpenAIResponsesWebSocketRequest(
 }
 
 interface ResponsesSteeringState {
+	connection?: ResponsesWS;
 	responseId?: string;
+	active: boolean;
 	acceptedSteers: number;
 	waitingForToolOutput: boolean;
 	pendingAcks: Array<{ resolve: (accepted: boolean) => void; input: ResponseInput; sent: boolean }>;
@@ -463,17 +466,26 @@ interface ResponsesSteeringState {
 function createResponsesSteeringController(connection: ResponsesWS): {
 	controller: ActiveResponseController;
 	state: ResponsesSteeringState;
+	deactivate: () => void;
 } {
 	const state: ResponsesSteeringState = {
+		connection,
+		active: true,
 		acceptedSteers: 0,
 		waitingForToolOutput: false,
 		pendingAcks: [],
 	};
 	return {
 		state,
+		deactivate() {
+			state.active = false;
+			state.connection = undefined;
+			state.responseId = undefined;
+			for (const pending of state.pendingAcks.splice(0)) pending.resolve(false);
+		},
 		controller: {
 			steer(input) {
-				if (state.waitingForToolOutput) return Promise.resolve(false);
+				if (!state.active || state.waitingForToolOutput) return Promise.resolve(false);
 				const content =
 					typeof input.content === "string"
 						? [{ type: "input_text", text: input.content }]
@@ -489,15 +501,16 @@ function createResponsesSteeringController(connection: ResponsesWS): {
 				const steeringInput = [{ role: "user", content }] as ResponseInput;
 				return new Promise((resolve) => {
 					state.pendingAcks.push({ resolve, input: steeringInput, sent: false });
-					if (state.responseId) sendPendingSteers(connection, state);
+					if (state.responseId) sendPendingSteers(state);
 				});
 			},
 		},
 	};
 }
 
-function sendPendingSteers(connection: ResponsesWS, state: ResponsesSteeringState): void {
-	if (!state.responseId) return;
+function sendPendingSteers(state: ResponsesSteeringState): void {
+	const connection = state.connection;
+	if (!state.active || !connection || !state.responseId) return;
 	for (const pending of state.pendingAcks) {
 		if (pending.sent) continue;
 		pending.sent = true;
@@ -533,7 +546,7 @@ async function* responsesWebSocketEvents(
 			if (event.type === "response.created" && event.response?.id) {
 				if (state.responseId && state.responseId !== event.response.id) state.acceptedSteers = 0;
 				state.responseId = event.response.id;
-				sendPendingSteers(connection, state);
+				sendPendingSteers(state);
 			} else if (event.type === "response.steer.accepted") {
 				state.acceptedSteers++;
 				const pending = state.pendingAcks.shift();

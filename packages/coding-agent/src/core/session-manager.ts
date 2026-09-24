@@ -460,15 +460,10 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 	}
 	if (entry.type === "compaction") {
 		const summary = createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
-		const baselineMarker: SystemMessage = entry.systemMessage
-			? { ...entry.systemMessage, reasoningEffortBaseline: true }
-			: {
-					role: "system",
-					content: "",
-					timestamp: new Date(entry.timestamp).getTime(),
-					reasoningEffortBaseline: true,
-				};
-		return [baselineMarker, summary];
+		if (entry.systemMessage) {
+			return [{ ...entry.systemMessage, reasoningEffortBaseline: true }, summary];
+		}
+		return [summary];
 	}
 	return [];
 }

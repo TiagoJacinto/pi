@@ -126,6 +126,18 @@ describe("session context edits", () => {
 		expect(text(session.buildSessionProjection().messages[0] as { content: string })).toBe("original");
 	});
 
+	it("pins the reasoning baseline on the preserved system message at compaction", () => {
+		const session = SessionManager.inMemory();
+		session.appendMessage({ role: "system", content: "session prompt", timestamp: Date.now() });
+		session.appendMessage({ role: "user", content: "summarized", timestamp: Date.now() });
+		session.appendCompaction("handoff", null, 100);
+
+		expect(session.buildSessionProjection().messages).toMatchObject([
+			{ role: "system", content: "session prompt", reasoningEffortBaseline: true },
+			{ role: "compactionSummary", summary: "handoff" },
+		]);
+	});
+
 	it("uses a self-referencing compaction to retain no preceding entries", () => {
 		const session = SessionManager.inMemory();
 		session.appendMessage({ role: "user", content: "discarded", timestamp: Date.now() });
@@ -135,7 +147,6 @@ describe("session context edits", () => {
 		const compaction = session.getEntry(compactionId);
 		expect(compaction).toMatchObject({ type: "compaction", firstKeptEntryId: compactionId });
 		expect(session.buildSessionProjection().messages.map((message) => message.role)).toEqual([
-			"system",
 			"compactionSummary",
 			"user",
 		]);
@@ -143,7 +154,7 @@ describe("session context edits", () => {
 			session
 				.buildSessionProjection()
 				.messages.map((message) => ("summary" in message ? message.summary : text(message as { content: string }))),
-		).toEqual(["", "exact handoff", "after"]);
+		).toEqual(["exact handoff", "after"]);
 	});
 
 	it("applies post-compaction edits to retained pre-compaction entries", () => {
@@ -157,7 +168,7 @@ describe("session context edits", () => {
 			session
 				.buildSessionProjection()
 				.messages.map((message) => ("summary" in message ? message.summary : text(message as { content: string }))),
-		).toEqual(["", "summary", "edited retained"]);
+		).toEqual(["summary", "edited retained"]);
 	});
 
 	it("uses only the newest summary when a repeated compaction retains entries before the older compaction", () => {
@@ -190,7 +201,7 @@ describe("session context edits", () => {
 		expect(session.getEntry(secondId)).toMatchObject({ firstKeptEntryId: secondId });
 		expect(
 			session.buildSessionProjection().messages.map((message) => ("summary" in message ? message.summary : "")),
-		).toEqual(["", "second handoff"]);
+		).toEqual(["second handoff"]);
 	});
 
 	it("does not trust pre-edit assistant usage for projected context estimates", () => {

@@ -439,10 +439,10 @@ describe("buildSessionContext", () => {
 		const entries: SessionEntry[] = [u1, a1, u2, a2, compaction, u3, a3];
 
 		const loaded = buildSessionContext(entries);
-		// baseline marker + summary + kept (u2, a2) + after (u3, a3) = 6
-		expect(loaded.messages.length).toBe(6);
-		expect(loaded.messages[0]).toMatchObject({ role: "system", reasoningEffortBaseline: true });
-		expect((loaded.messages[1] as any).summary).toContain("Summary of 1,a,2,b");
+		// summary + kept (u2, a2) + after (u3, a3) = 5
+		expect(loaded.messages.length).toBe(5);
+		expect(loaded.messages[0].role).toBe("compactionSummary");
+		expect((loaded.messages[0] as any).summary).toContain("Summary of 1,a,2,b");
 	});
 
 	it("should handle multiple compactions (only latest matters)", () => {
@@ -463,10 +463,9 @@ describe("buildSessionContext", () => {
 		const entries: SessionEntry[] = [u1, a1, compact1, u2, b, u3, c, compact2, u4, d];
 
 		const loaded = buildSessionContext(entries);
-		// baseline marker + summary + kept from u3 (u3, c) + after (u4, d) = 6
-		expect(loaded.messages.length).toBe(6);
-		expect(loaded.messages[0]).toMatchObject({ role: "system", reasoningEffortBaseline: true });
-		expect((loaded.messages[1] as any).summary).toContain("Second summary");
+		// summary + kept from u3 (u3, c) + after (u4, d) = 5
+		expect(loaded.messages.length).toBe(5);
+		expect((loaded.messages[0] as any).summary).toContain("Second summary");
 	});
 
 	it("should keep all messages when firstKeptEntryId is first entry", () => {
@@ -479,9 +478,8 @@ describe("buildSessionContext", () => {
 		const entries: SessionEntry[] = [u1, a1, compact1, u2, b];
 
 		const loaded = buildSessionContext(entries);
-		// baseline marker + summary + all messages (u1, a1, u2, b) = 6
-		expect(loaded.messages.length).toBe(6);
-		expect(loaded.messages[0]).toMatchObject({ role: "system", reasoningEffortBaseline: true });
+		// summary + all messages (u1, a1, u2, b) = 5
+		expect(loaded.messages.length).toBe(5);
 	});
 
 	it("should track model and thinking level changes", () => {

@@ -2,13 +2,23 @@ import type { ResponseStreamEvent } from "openai/resources/responses/responses.j
 import { describe, expect, it, vi } from "vitest";
 import { stream } from "../src/api/openai-responses.ts";
 import { convertResponsesMessages, convertResponsesTools } from "../src/api/openai-responses-shared.ts";
+import { getModel } from "../src/compat.ts";
 import type { Message, Model, Tool } from "../src/types.ts";
 import { normalizeContext, toToolDeclaration } from "../src/utils/transcript.ts";
 
 const capturedRequests: Record<string, unknown>[] = [];
 const fakeWSState = vi.hoisted(() => ({
 	instances: [] as unknown[],
-	mode: "steering" as "steering" | "pending" | "failed" | "late-failed" | "cancelled" | "async" | "duplicate-steer",
+	mode: "steering" as
+		| "steering"
+		| "pending"
+		| "failed"
+		| "late-failed"
+		| "cancelled"
+		| "async"
+		| "duplicate-steer"
+		| "ephemeral",
+	ephemeralAsync: false,
 }));
 let responseIndex = 0;
 
@@ -45,6 +55,78 @@ vi.mock("openai/resources/responses/ws", () => ({
 		}
 
 		async *stream() {
+			if (fakeWSState.mode === "ephemeral") {
+				const requestIndex = fakeWSState.instances.indexOf(this);
+				const responseId = requestIndex === 0 ? "response-ephemeral-a" : "response-ephemeral-b";
+				yield { type: "message", message: { type: "response.created", response: { id: responseId } } };
+				this.resolveCreated();
+				if (requestIndex === 0 && fakeWSState.ephemeralAsync) {
+					yield {
+						type: "message",
+						message: {
+							type: "response.output_item.added",
+							output_index: 0,
+							item: {
+								type: "function_call",
+								id: "fc-ephemeral",
+								call_id: "call-ephemeral",
+								name: "work",
+								arguments: "{}",
+								async: true,
+							},
+						},
+					};
+					yield {
+						type: "message",
+						message: {
+							type: "response.output_item.done",
+							output_index: 0,
+							item: {
+								type: "function_call",
+								id: "fc-ephemeral",
+								call_id: "call-ephemeral",
+								name: "work",
+								arguments: "{}",
+								async: true,
+							},
+						},
+					};
+				} else if (requestIndex === 0) {
+					yield {
+						type: "message",
+						message: {
+							type: "response.output_item.added",
+							output_index: 0,
+							item: {
+								type: "message",
+								id: "msg-ephemeral",
+								role: "assistant",
+								status: "in_progress",
+								content: [],
+							},
+						},
+					};
+					yield {
+						type: "message",
+						message: {
+							type: "response.output_item.done",
+							output_index: 0,
+							item: {
+								type: "message",
+								id: "msg-ephemeral",
+								role: "assistant",
+								status: "completed",
+								content: [{ type: "output_text", text: "first answer", annotations: [] }],
+							},
+						},
+					};
+				}
+				yield {
+					type: "message",
+					message: { type: "response.completed", response: { id: responseId, status: "completed" } },
+				};
+				return;
+			}
 			if (fakeWSState.mode === "cancelled") {
 				yield { type: "message", message: { type: "response.created", response: { id: "response-cancelled" } } };
 				this.resolveCreated();
@@ -306,6 +388,22 @@ async function captureRequest(
 }
 
 describe("OpenAI Responses native controls serialization", () => {
+	it("loads independent native capability flags from direct OpenAI model metadata", () => {
+		for (const modelId of ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] as const) {
+			const compat = getModel("openai", modelId)?.compat;
+			expect(compat).toMatchObject({
+				supportsAsyncToolCalling: true,
+				supportsNativeSteering: true,
+				supportsReasoningEffortUpdates: true,
+			});
+		}
+		expect(getModel("openai", "gpt-5.6-luna")?.compat).not.toMatchObject({
+			supportsAsyncToolCalling: true,
+			supportsNativeSteering: true,
+			supportsReasoningEffortUpdates: true,
+		});
+	});
+
 	it("pins request effort while successive configuration updates change effective effort", async () => {
 		capturedRequests.length = 0;
 		responseIndex = 0;
@@ -411,6 +509,116 @@ describe("OpenAI Responses native controls serialization", () => {
 		expect(next.reasoningEffortBaseline).toBe("high");
 	});
 
+	it("replays reasoning updates on a fresh no-sessionId socket with the pinned baseline", async () => {
+		fakeWSState.instances.length = 0;
+		fakeWSState.mode = "ephemeral";
+		fakeWSState.ephemeralAsync = false;
+		const model = {
+			...createModel(),
+			compat: { supportsReasoningEffortUpdates: true, supportsNativeSteering: true },
+		};
+		const firstUser = { role: "user" as const, content: "first turn", timestamp: 1 };
+		const first = stream(model, normalizeContext({ messages: [firstUser] }), {
+			apiKey: "test",
+			reasoningEffort: "low",
+		});
+		for await (const _event of first) {
+			// Drain the first ephemeral response.
+		}
+		const firstAssistant = await first.result();
+		const update = { role: "system" as const, content: "", reasoningEffortUpdate: "high" as const, timestamp: 2 };
+		const secondUser = { role: "user" as const, content: "second turn", timestamp: 3 };
+		const second = stream(model, normalizeContext({ messages: [firstUser, firstAssistant, update, secondUser] }), {
+			apiKey: "test",
+			reasoningEffort: "high",
+		});
+		for await (const _event of second) {
+			// Drain the fresh full-history request.
+		}
+
+		const [socketA, socketB] = fakeWSState.instances as Array<{
+			sent: Array<Record<string, unknown>>;
+			socket: { readyState: number };
+		}>;
+		expect((await first.result()).responseId).toBe("response-ephemeral-a");
+		expect(socketA.socket.readyState).toBe(3);
+		expect(socketB.sent[0]).not.toHaveProperty("previous_response_id");
+		const request = socketB.sent[0] as {
+			reasoning?: { effort?: string };
+			input: Array<{
+				type?: string;
+				role?: string;
+				content?: Array<{ text?: string }>;
+				reasoning?: { effort?: string };
+			}>;
+		};
+		expect(request.reasoning?.effort).toBe("low");
+		const updateIndex = request.input.findIndex((item) => item.type === "configuration_update");
+		expect(request.input[updateIndex]).toMatchObject({ reasoning: { effort: "high" } });
+		expect(request.input[updateIndex - 1]).toMatchObject({ role: "assistant" });
+		expect(request.input[updateIndex + 1]).toMatchObject({ role: "user" });
+	});
+
+	it("replays a late async result by call_id on a fresh no-sessionId socket", async () => {
+		fakeWSState.instances.length = 0;
+		fakeWSState.mode = "ephemeral";
+		fakeWSState.ephemeralAsync = true;
+		const model = { ...createModel(), compat: { supportsAsyncToolCalling: true } };
+		const tool = {
+			name: "work",
+			label: "Work",
+			description: "Do work",
+			parameters: { type: "object", properties: {} },
+			async: true,
+		} as unknown as Tool;
+		const user = { role: "user" as const, content: "start", timestamp: 1 };
+		const first = stream(model, normalizeContext({ messages: [user], tools: [tool] }), { apiKey: "test" });
+		for await (const _event of first) {
+			// The response finishes while the async tool result is still pending in Pi.
+		}
+		const assistant = await first.result();
+		const call = assistant.content.find((item) => item.type === "toolCall");
+		expect(call).toMatchObject({ id: "call-ephemeral|fc-ephemeral", async: true });
+
+		const second = stream(
+			model,
+			normalizeContext({
+				messages: [
+					user,
+					assistant,
+					{
+						role: "toolResult",
+						toolCallId: call!.id,
+						toolName: "work",
+						content: [{ type: "text", text: "late result" }],
+						isError: false,
+						timestamp: 2,
+					},
+				],
+				tools: [tool],
+			}),
+			{ apiKey: "test" },
+		);
+		for await (const _event of second) {
+			// Drain the fresh full-history continuation.
+		}
+
+		const [socketA, socketB] = fakeWSState.instances as Array<{
+			sent: Array<Record<string, unknown>>;
+			socket: { readyState: number };
+		}>;
+		expect((await first.result()).responseId).toBe("response-ephemeral-a");
+		expect(socketA.socket.readyState).toBe(3);
+		expect(socketB.sent[0]).not.toHaveProperty("previous_response_id");
+		const replay = (socketB.sent[0] as { input: Array<Record<string, unknown>> }).input;
+		expect(replay).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ type: "function_call", call_id: "call-ephemeral" }),
+				expect.objectContaining({ type: "function_call_output", call_id: "call-ephemeral", output: "late result" }),
+			]),
+		);
+	});
+
 	it("steers an active response on the same WebSocket and follows its successor", async () => {
 		fakeWSState.instances.length = 0;
 		fakeWSState.mode = "steering";
@@ -418,10 +626,7 @@ describe("OpenAI Responses native controls serialization", () => {
 		const response = stream(
 			model,
 			normalizeContext({ messages: [{ role: "user", content: "start", timestamp: 1 }] }),
-			{
-				apiKey: "test",
-				sessionId: "steering-test",
-			},
+			{ apiKey: "test" },
 		);
 		const events = (async () => {
 			for await (const _event of response) {
@@ -434,8 +639,9 @@ describe("OpenAI Responses native controls serialization", () => {
 			created: Promise<void>;
 		};
 		await ws.created;
+		const staleController = response.activeResponseController;
 		await expect(
-			response.activeResponseController?.steer({ role: "user", content: "Leave auth.ts unchanged.", timestamp: 2 }),
+			staleController?.steer({ role: "user", content: "Leave auth.ts unchanged.", timestamp: 2 }),
 		).resolves.toBe(true);
 		await events;
 
@@ -446,6 +652,10 @@ describe("OpenAI Responses native controls serialization", () => {
 			input: [{ role: "user", content: [{ type: "input_text", text: "Leave auth.ts unchanged." }] }],
 		});
 		expect(await response.result()).toMatchObject({ responseId: "response-successor", stopReason: "stop" });
+		expect(ws.sent).toHaveLength(2);
+		expect(response.activeResponseController).toBeUndefined();
+		await expect(staleController?.steer({ role: "user", content: "too late", timestamp: 3 })).resolves.toBe(false);
+		expect(ws.sent).toHaveLength(2);
 	});
 
 	it("removes only the accepted copy of repeated steering text during continuation", async () => {

@@ -922,6 +922,26 @@ function applyOpenAICompletionsTranscriptMetadata(model: Model<Api>): void {
 // `additional_tools` items through to OpenAI unchanged; tool search is not verified
 // through those proxies.
 const OPENAI_RESPONSES_PROXY_PROVIDERS = new Set(["opencode", "opencode-go", "github-copilot"]);
+const OPENAI_RESPONSES_NATIVE_CAPABILITIES: Record<
+	string,
+	Pick<OpenAIResponsesCompat, "supportsAsyncToolCalling" | "supportsNativeSteering" | "supportsReasoningEffortUpdates">
+> = {
+	"gpt-6-astra": {
+		supportsAsyncToolCalling: true,
+		supportsNativeSteering: true,
+		supportsReasoningEffortUpdates: true,
+	},
+	"gpt-6-sol": {
+		supportsAsyncToolCalling: true,
+		supportsNativeSteering: true,
+		supportsReasoningEffortUpdates: true,
+	},
+	"gpt-6-luna": {
+		supportsAsyncToolCalling: true,
+		supportsNativeSteering: true,
+		supportsReasoningEffortUpdates: true,
+	},
+};
 
 function applyOpenAIResponsesTranscriptMetadata(model: Model<Api>): void {
 	const isOpenAIResponses = model.provider === "openai" && model.api === "openai-responses";
@@ -929,20 +949,18 @@ function applyOpenAIResponsesTranscriptMetadata(model: Model<Api>): void {
 	const isProxiedResponses =
 		OPENAI_RESPONSES_PROXY_PROVIDERS.has(model.provider) && model.api === "openai-responses";
 	if (!(isOpenAIResponses || isOpenAICodex || isProxiedResponses)) return;
-	const supportsNewResponsesControls = isOpenAIResponses && model.id.startsWith("gpt-6");
-	if (!supportsNewResponsesControls && !OPENAI_MID_CONVO_SYSTEM_MESSAGE_MODEL_IDS.has(model.id)) return;
+	const nativeCapabilities = isOpenAIResponses ? OPENAI_RESPONSES_NATIVE_CAPABILITIES[model.id] : undefined;
+	if (!nativeCapabilities && !OPENAI_MID_CONVO_SYSTEM_MESSAGE_MODEL_IDS.has(model.id)) return;
 	model.compat = {
 		...(model.compat as OpenAIResponsesCompat | undefined),
 		...(OPENAI_MID_CONVO_SYSTEM_MESSAGE_MODEL_IDS.has(model.id)
 			? { supportsMidConvoSystemMessages: true }
 			: {}),
 		...(isProxiedResponses ? { supportsAdditionalTools: true } : {}),
-		...(supportsNewResponsesControls
-			? {
-					supportsAsyncToolCalling: true,
-					supportsNativeSteering: true,
-					supportsReasoningEffortUpdates: true,
-				}
+		...(nativeCapabilities?.supportsAsyncToolCalling ? { supportsAsyncToolCalling: true } : {}),
+		...(nativeCapabilities?.supportsNativeSteering ? { supportsNativeSteering: true } : {}),
+		...(nativeCapabilities?.supportsReasoningEffortUpdates
+			? { supportsReasoningEffortUpdates: true }
 			: {}),
 	};
 }
