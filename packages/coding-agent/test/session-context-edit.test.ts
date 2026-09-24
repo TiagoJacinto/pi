@@ -135,6 +135,7 @@ describe("session context edits", () => {
 		const compaction = session.getEntry(compactionId);
 		expect(compaction).toMatchObject({ type: "compaction", firstKeptEntryId: compactionId });
 		expect(session.buildSessionProjection().messages.map((message) => message.role)).toEqual([
+			"system",
 			"compactionSummary",
 			"user",
 		]);
@@ -142,7 +143,7 @@ describe("session context edits", () => {
 			session
 				.buildSessionProjection()
 				.messages.map((message) => ("summary" in message ? message.summary : text(message as { content: string }))),
-		).toEqual(["exact handoff", "after"]);
+		).toEqual(["", "exact handoff", "after"]);
 	});
 
 	it("applies post-compaction edits to retained pre-compaction entries", () => {
@@ -156,7 +157,7 @@ describe("session context edits", () => {
 			session
 				.buildSessionProjection()
 				.messages.map((message) => ("summary" in message ? message.summary : text(message as { content: string }))),
-		).toEqual(["summary", "edited retained"]);
+		).toEqual(["", "summary", "edited retained"]);
 	});
 
 	it("uses only the newest summary when a repeated compaction retains entries before the older compaction", () => {
@@ -189,7 +190,7 @@ describe("session context edits", () => {
 		expect(session.getEntry(secondId)).toMatchObject({ firstKeptEntryId: secondId });
 		expect(
 			session.buildSessionProjection().messages.map((message) => ("summary" in message ? message.summary : "")),
-		).toEqual(["second handoff"]);
+		).toEqual(["", "second handoff"]);
 	});
 
 	it("does not trust pre-edit assistant usage for projected context estimates", () => {

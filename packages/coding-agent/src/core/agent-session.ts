@@ -371,6 +371,7 @@ export class AgentSession {
 	private readonly _entryIdsByMessage = new WeakMap<object, string>();
 	private readonly _boundaryDispatchedMessages = new WeakSet<object>();
 	private _lastAssistantMessage: AssistantMessage | undefined;
+	private _pendingReasoningEffortUpdate?: SystemMessage;
 	private _lastAssistantToolResults: AgentMessage[] = [];
 	private _lastActivityOutcome: AgentActivityOutcome = "completed";
 	private _isBeforeSettle = false;
@@ -727,6 +728,24 @@ export class AgentSession {
 	// Event Subscription
 	// =========================================================================
 
+	private _appendPendingReasoningEffortUpdate(): void {
+		const message = this._pendingReasoningEffortUpdate;
+		if (!message) return;
+		this._pendingReasoningEffortUpdate = undefined;
+		this.sessionManager.appendMessage(message);
+		this._refreshFinalizedContext();
+	}
+
+	private _appendReasoningEffortBaseline(): void {
+		this.sessionManager.appendMessage({
+			role: "system",
+			content: "",
+			reasoningEffortBaseline: true,
+			timestamp: Date.now(),
+		});
+		this._refreshFinalizedContext();
+	}
+
 	private _refreshFinalizedContext(): void {
 		const projection = this.sessionManager.buildSessionProjection();
 		for (const entry of projection.entries) {
@@ -943,6 +962,7 @@ export class AgentSession {
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
 			if (event.message.role === "assistant") {
+				this._appendPendingReasoningEffortUpdate();
 				const assistantMsg = event.message as AssistantMessage;
 				this._lastAssistantMessage = assistantMsg;
 				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "length") {
@@ -2123,6 +2143,7 @@ export class AgentSession {
 		const previousModel = this.model;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(model);
 		this.agent.state.model = model;
+		this._appendReasoningEffortBaseline();
 		this.sessionManager.appendModelChange(model.provider, model.id);
 		if (options.persist) {
 			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
@@ -2190,6 +2211,7 @@ export class AgentSession {
 
 		// Apply model
 		this.agent.state.model = next.model;
+		this._appendReasoningEffortBaseline();
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
 		if (options.persist) {
 			this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
@@ -2225,6 +2247,7 @@ export class AgentSession {
 
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(nextModel);
 		this.agent.state.model = nextModel;
+		this._appendReasoningEffortBaseline();
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		if (options.persist) {
 			this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
@@ -2266,6 +2289,18 @@ export class AgentSession {
 
 		if (isChanging) {
 			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
+			if (
+				(this.model?.compat as { supportsReasoningEffortUpdates?: boolean } | undefined)
+					?.supportsReasoningEffortUpdates
+			) {
+				this._pendingReasoningEffortUpdate = {
+					role: "system",
+					content: "",
+					reasoningEffortUpdate: effectiveLevel,
+					timestamp: Date.now(),
+				};
+				if (!this.agent.state.isStreaming) this._appendPendingReasoningEffortUpdate();
+			}
 			this._emit({ type: "thinking_level_changed", level: effectiveLevel });
 			void this._extensionRunner.emit({
 				type: "thinking_level_select",

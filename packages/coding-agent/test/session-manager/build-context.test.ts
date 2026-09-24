@@ -136,13 +136,14 @@ describe("buildSessionContext", () => {
 			];
 			const ctx = buildSessionContext(entries);
 
-			// Should have: summary + kept (3,4) + after (6,7) = 5 messages
-			expect(ctx.messages).toHaveLength(5);
-			expect((ctx.messages[0] as any).summary).toContain("Summary of first two turns");
-			expect((ctx.messages[1] as any).content).toBe("second");
-			expect((ctx.messages[2] as any).content[0].text).toBe("response2");
-			expect((ctx.messages[3] as any).content).toBe("third");
-			expect((ctx.messages[4] as any).content[0].text).toBe("response3");
+			// The baseline marker precedes the summary and retained messages.
+			expect(ctx.messages).toHaveLength(6);
+			expect(ctx.messages[0]).toMatchObject({ role: "system", reasoningEffortBaseline: true });
+			expect((ctx.messages[1] as any).summary).toContain("Summary of first two turns");
+			expect((ctx.messages[2] as any).content).toBe("second");
+			expect((ctx.messages[3] as any).content[0].text).toBe("response2");
+			expect((ctx.messages[4] as any).content).toBe("third");
+			expect((ctx.messages[5] as any).content[0].text).toBe("response3");
 		});
 
 		it("handles compaction keeping from first message", () => {
@@ -154,9 +155,10 @@ describe("buildSessionContext", () => {
 			];
 			const ctx = buildSessionContext(entries);
 
-			// Summary + all messages (1,2,4)
-			expect(ctx.messages).toHaveLength(4);
-			expect((ctx.messages[0] as any).summary).toContain("Empty summary");
+			// Baseline marker + summary + all messages (1,2,4)
+			expect(ctx.messages).toHaveLength(5);
+			expect((ctx.messages[0] as any).reasoningEffortBaseline).toBe(true);
+			expect((ctx.messages[1] as any).summary).toContain("Empty summary");
 		});
 
 		it("multiple compactions uses latest", () => {
@@ -171,9 +173,10 @@ describe("buildSessionContext", () => {
 			];
 			const ctx = buildSessionContext(entries);
 
-			// Should use second summary, keep from 4
-			expect(ctx.messages).toHaveLength(4);
-			expect((ctx.messages[0] as any).summary).toContain("Second summary");
+			// Should use the latest baseline marker and summary, keeping from 4
+			expect(ctx.messages).toHaveLength(5);
+			expect((ctx.messages[0] as any).reasoningEffortBaseline).toBe(true);
+			expect((ctx.messages[1] as any).summary).toContain("Second summary");
 		});
 
 		it("buildContextEntries returns compaction-aware entries including custom entries", () => {
@@ -190,7 +193,13 @@ describe("buildSessionContext", () => {
 
 			expect(buildContextEntries(entries).map((entry) => entry.id)).toEqual(["6", "4", "5", "7", "8"]);
 			const ctx = buildSessionContext(entries);
-			expect(ctx.messages.map((message) => message.role)).toEqual(["compactionSummary", "user", "assistant"]);
+			expect(ctx.messages.map((message) => message.role)).toEqual([
+				"system",
+				"compactionSummary",
+				"user",
+				"assistant",
+			]);
+			expect(ctx.messages[0]).toMatchObject({ reasoningEffortBaseline: true });
 		});
 
 		it("keeps settings from the full path after compaction", () => {
@@ -204,7 +213,7 @@ describe("buildSessionContext", () => {
 
 			const ctx = buildSessionContext(entries);
 			expect(ctx.thinkingLevel).toBe("high");
-			expect(ctx.messages.map((message) => message.role)).toEqual(["compactionSummary", "user"]);
+			expect(ctx.messages.map((message) => message.role)).toEqual(["system", "compactionSummary", "user"]);
 		});
 	});
 
@@ -265,14 +274,14 @@ describe("buildSessionContext", () => {
 				msg("11", "10", "user", "better approach"),
 			];
 
-			// Main path to 7: summary + kept(3,4) + after(6,7)
+			// Main path to 7: baseline marker + summary + kept(3,4) + after(6,7)
 			const ctxMain = buildSessionContext(entries, "7");
-			expect(ctxMain.messages).toHaveLength(5);
-			expect((ctxMain.messages[0] as any).summary).toContain("Compacted history");
-			expect((ctxMain.messages[1] as any).content).toBe("q2");
-			expect((ctxMain.messages[2] as any).content[0].text).toBe("r2");
-			expect((ctxMain.messages[3] as any).content).toBe("q3");
-			expect((ctxMain.messages[4] as any).content[0].text).toBe("r3");
+			expect(ctxMain.messages).toHaveLength(6);
+			expect((ctxMain.messages[1] as any).summary).toContain("Compacted history");
+			expect((ctxMain.messages[2] as any).content).toBe("q2");
+			expect((ctxMain.messages[3] as any).content[0].text).toBe("r2");
+			expect((ctxMain.messages[4] as any).content).toBe("q3");
+			expect((ctxMain.messages[5] as any).content[0].text).toBe("r3");
 
 			// Branch path to 11: 1,2,3 + branch_summary + 11
 			const ctxBranch = buildSessionContext(entries, "11");
