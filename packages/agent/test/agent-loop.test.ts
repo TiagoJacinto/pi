@@ -2080,4 +2080,70 @@ describe("agentLoopContinue with AgentMessage", () => {
 		expect(messages.length).toBe(1);
 		expect(messages[0].role).toBe("assistant");
 	});
+
+	it("starts eligible async tool calls before the provider response finishes", async () => {
+		let releaseTool!: () => void;
+		let resolveStarted!: () => void;
+		const toolGate = new Promise<void>((resolve) => {
+			releaseTool = resolve;
+		});
+		const started = new Promise<void>((resolve) => {
+			resolveStarted = resolve;
+		});
+		let toolFinished = false;
+		let providerContinuedWhileToolRunning = false;
+		const tool = {
+			name: "slow",
+			label: "Slow",
+			description: "Slow async tool",
+			parameters: Type.Object({ value: Type.String() }),
+			async: true,
+			async execute() {
+				resolveStarted();
+				await toolGate;
+				toolFinished = true;
+				return { content: [{ type: "text" as const, text: "finished" }], details: { value: "x" } };
+			},
+		} satisfies AgentTool<any, { value: string }>;
+		const model = { ...createModel(), compat: { supportsAsyncToolCalling: true } };
+		const context: AgentContext = { messages: [], tools: [tool] };
+		const config: AgentLoopConfig = { model, convertToLlm: identityConverter };
+		let request = 0;
+		const stream = agentLoop([createUserMessage("start")], context, config, undefined, () => {
+			const result = new MockAssistantStream();
+			queueMicrotask(async () => {
+				if (request++ > 0) {
+					result.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "done" }]),
+					});
+					return;
+				}
+				const partial = createAssistantMessage([], "pending");
+				result.push({ type: "start", partial });
+				const toolCall = {
+					type: "toolCall" as const,
+					id: "call-original",
+					name: "slow",
+					arguments: { value: "x" },
+					async: true,
+				};
+				partial.content.push(toolCall);
+				result.push({ type: "toolcall_end", contentIndex: 0, partial, toolCall } as AssistantMessageEvent);
+				await started;
+				providerContinuedWhileToolRunning = !toolFinished;
+				result.push({ type: "text_start", contentIndex: 1, partial } as AssistantMessageEvent);
+				result.push({ type: "done", reason: "toolUse", message: createAssistantMessage([toolCall], "toolUse") });
+				releaseTool();
+			});
+			return result;
+		});
+		const events: AgentEvent[] = [];
+		for await (const event of stream) events.push(event);
+
+		const result = (await stream.result()).find((message) => message.role === "toolResult");
+		expect(providerContinuedWhileToolRunning).toBe(true);
+		expect(result).toMatchObject({ role: "toolResult", toolCallId: "call-original" });
+	});
 });

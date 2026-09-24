@@ -1188,6 +1188,74 @@ describe("Agent", () => {
 		expect(providerEvents).toEqual([{ request_cost: 0.01 }]);
 	});
 
+	it("routes active-response steering through the provider controller", async () => {
+		const steering = createUserMessage("steer natively");
+		let agent!: Agent;
+		let streamCalls = 0;
+		const agentStreamController: { steer(message: UserMessage): Promise<boolean> } = {
+			async steer(message) {
+				expect(message).toBe(steering);
+				return true;
+			},
+		};
+		agent = new Agent({
+			streamFn: () => {
+				streamCalls++;
+				const stream = new MockAssistantStream() as MockAssistantStream & {
+					activeResponseController?: typeof agentStreamController;
+				};
+				stream.activeResponseController = agentStreamController;
+				setTimeout(() => agent.steer(steering), 0);
+				setTimeout(
+					() => stream.push({ type: "done", reason: "stop", message: createAssistantMessage("done") }),
+					10,
+				);
+				return stream;
+			},
+		});
+
+		await agent.prompt("start");
+
+		expect(streamCalls).toBe(1);
+		expect(agent.state.messages).toContain(steering);
+		expect(agent.hasQueuedMessages()).toBe(false);
+	});
+
+	it("keeps queued steering as the fallback when no active response controller exists", async () => {
+		const steering = createUserMessage("queued fallback");
+		let agent!: Agent;
+		let streamCalls = 0;
+		let secondRequestIncludedSteering = false;
+		agent = new Agent({
+			streamFn: (_model, context) => {
+				streamCalls++;
+				if (streamCalls === 2) {
+					secondRequestIncludedSteering = context.messages.some(
+						(message) => message.role === "user" && message.content === "queued fallback",
+					);
+				}
+				const stream = new MockAssistantStream();
+				if (streamCalls === 1) {
+					setTimeout(() => agent.steer(steering), 0);
+					setTimeout(
+						() => stream.push({ type: "done", reason: "stop", message: createAssistantMessage("first") }),
+						10,
+					);
+				} else {
+					queueMicrotask(() =>
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("second") }),
+					);
+				}
+				return stream;
+			},
+		});
+
+		await agent.prompt("start");
+
+		expect(streamCalls).toBe(2);
+		expect(secondRequestIncludedSteering).toBe(true);
+	});
+
 	it("forwards sessionId to streamFunction options", async () => {
 		let receivedSessionId: string | undefined;
 		const agent = new Agent({

@@ -1,4 +1,5 @@
 import {
+	type ActiveResponseController,
 	createInitialSystemMessage,
 	getCurrentSystemMessage,
 	getCurrentSystemPrompt,
@@ -171,6 +172,11 @@ class PendingMessageQueue {
 	clear(): void {
 		this.messages = [];
 	}
+
+	remove(message: AgentMessage): void {
+		const index = this.messages.indexOf(message);
+		if (index >= 0) this.messages.splice(index, 1);
+	}
 }
 
 type ActiveRun = {
@@ -190,6 +196,8 @@ export class Agent {
 	private readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();
 	private readonly steeringQueue: PendingMessageQueue;
 	private readonly followUpQueue: PendingMessageQueue;
+	private activeResponseController?: ActiveResponseController;
+	private nativeSteeringMessages: AgentMessage[] = [];
 
 	public convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	public transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
@@ -297,7 +305,22 @@ export class Agent {
 
 	/** Queue a message to be injected after the current assistant turn finishes. */
 	steer(message: AgentMessage): void {
+		const controller = this.activeResponseController;
+		if (!controller || message.role !== "user") {
+			this.steeringQueue.enqueue(message);
+			return;
+		}
 		this.steeringQueue.enqueue(message);
+		void controller
+			.steer(message)
+			.then((accepted) => {
+				if (!accepted) return;
+				this.steeringQueue.remove(message);
+				this.nativeSteeringMessages.push(message);
+			})
+			.catch(() => {
+				// Rejected provider steering remains in Pi's existing queue for fallback delivery.
+			});
 	}
 
 	/** Queue a message to run only after the agent would otherwise stop. */
@@ -365,6 +388,7 @@ export class Agent {
 		this._state.errorMessage = undefined;
 		this.clearFollowUpQueue();
 		this.clearSteeringQueue();
+		this.nativeSteeringMessages = [];
 	}
 
 	/** Start a new prompt from text, a single message, or a batch of messages. */
@@ -493,6 +517,10 @@ export class Agent {
 			convertToLlm: this.convertToLlm,
 			transformContext: this.transformContext,
 			getApiKey: this.getApiKey,
+			setActiveResponseController: (controller) => {
+				this.activeResponseController = controller;
+			},
+			getNativeSteeringMessages: async () => this.nativeSteeringMessages.splice(0),
 			getSteeringMessages: async () => {
 				if (skipInitialSteeringPoll) {
 					skipInitialSteeringPoll = false;
@@ -551,6 +579,7 @@ export class Agent {
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
+		this.activeResponseController = undefined;
 		this.activeRun?.resolve();
 		this.activeRun = undefined;
 	}

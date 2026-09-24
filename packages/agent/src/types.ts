@@ -1,4 +1,5 @@
 import type {
+	ActiveResponseController,
 	Api,
 	AssistantMessage,
 	AssistantMessageEvent,
@@ -188,6 +189,10 @@ export interface PrepareNextTurnContext extends AgentTurnContext {}
 
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
+	/** Receives the controller for a provider response while it is active. */
+	setActiveResponseController?: (controller?: ActiveResponseController) => void;
+	/** Drain messages already accepted by an active provider response. */
+	getNativeSteeringMessages?: () => Promise<AgentMessage[]>;
 
 	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
