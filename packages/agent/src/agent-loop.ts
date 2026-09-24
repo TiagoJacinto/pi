@@ -255,8 +255,10 @@ async function runLoop(
 						!supportsAsync ||
 						config.transport === "sse" ||
 						!tool?.async ||
+						!toolCall.async ||
 						config.toolExecution === "sequential" ||
-						tool.executionMode === "sequential"
+						tool.executionMode === "sequential" ||
+						currentContext.tools?.some((candidate) => candidate.executionMode === "sequential")
 					) {
 						return;
 					}
@@ -474,6 +476,8 @@ async function streamAssistantResponse(
 		for await (const event of response) {
 			switch (event.type) {
 				case "start":
+					// Some providers install the controller asynchronously before emitting start.
+					config.setActiveResponseController?.(response.activeResponseController);
 					partialMessage = event.partial;
 					context.messages.push(partialMessage);
 					addedPartial = true;

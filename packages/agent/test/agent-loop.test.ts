@@ -2146,4 +2146,94 @@ describe("agentLoopContinue with AgentMessage", () => {
 		expect(providerContinuedWhileToolRunning).toBe(true);
 		expect(result).toMatchObject({ role: "toolResult", toolCallId: "call-original" });
 	});
+
+	it("retains out-of-order async results when the provider response finishes first", async () => {
+		const releases = new Map<string, () => void>();
+		const started = new Map<string, () => void>();
+		const finished: string[] = [];
+		let providerFinished = false;
+		const tools = ["alpha", "beta"].map(
+			(name) =>
+				({
+					name,
+					label: name,
+					description: name,
+					parameters: Type.Object({}),
+					async: true,
+					execute: async () => {
+						started.get(name)?.();
+						await new Promise<void>((resolve) => releases.set(name, resolve));
+						finished.push(name);
+						return { content: [{ type: "text" as const, text: name }], details: {} };
+					},
+				}) satisfies AgentTool<any, Record<string, never>>,
+		);
+		const bothStarted = Promise.all(
+			["alpha", "beta"].map((name) => new Promise<void>((resolve) => started.set(name, resolve))),
+		);
+		const context: AgentContext = { messages: [], tools };
+		const model = { ...createModel(), compat: { supportsAsyncToolCalling: true } };
+		let request = 0;
+		const stream = agentLoop(
+			[createUserMessage("start")],
+			context,
+			{ model, convertToLlm: identityConverter },
+			undefined,
+			() => {
+				const result = new MockAssistantStream();
+				queueMicrotask(async () => {
+					if (request++ > 0) {
+						result.push({
+							type: "done",
+							reason: "stop",
+							message: createAssistantMessage([{ type: "text", text: "done" }]),
+						});
+						return;
+					}
+					const partial = createAssistantMessage([]);
+					result.push({ type: "start", partial });
+					for (const [index, name] of ["alpha", "beta"].entries()) {
+						const toolCall = {
+							type: "toolCall" as const,
+							id: `call-${name}`,
+							name,
+							arguments: {},
+							async: true,
+						};
+						partial.content.push(toolCall);
+						result.push({
+							type: "toolcall_end",
+							contentIndex: index,
+							partial,
+							toolCall,
+						} as AssistantMessageEvent);
+					}
+					await bothStarted;
+					result.push({
+						type: "done",
+						reason: "toolUse",
+						message: createAssistantMessage([
+							{ type: "toolCall", id: "call-alpha", name: "alpha", arguments: {} },
+							{ type: "toolCall", id: "call-beta", name: "beta", arguments: {} },
+						]),
+					});
+					providerFinished = true;
+					setTimeout(() => releases.get("beta")?.(), 0);
+					setTimeout(() => releases.get("alpha")?.(), 5);
+				});
+				return result;
+			},
+		);
+		for await (const _event of stream) {
+			// Drain through continuation.
+		}
+		const results = (await stream.result()).filter((message) => message.role === "toolResult");
+
+		expect(providerFinished).toBe(true);
+		expect(finished).toEqual(["beta", "alpha"]);
+		expect(results.map((message) => [message.toolCallId, message.content[0]])).toEqual([
+			["call-alpha", { type: "text", text: "alpha" }],
+			["call-beta", { type: "text", text: "beta" }],
+		]);
+	});
 });

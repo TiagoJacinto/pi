@@ -1204,8 +1204,14 @@ describe("Agent", () => {
 				const stream = new MockAssistantStream() as MockAssistantStream & {
 					activeResponseController?: typeof agentStreamController;
 				};
-				stream.activeResponseController = agentStreamController;
-				setTimeout(() => agent.steer(steering), 0);
+				setTimeout(() => {
+					stream.activeResponseController = agentStreamController;
+					const partial = createAssistantMessage("");
+					partial.content = [];
+					partial.stopReason = "pending";
+					stream.push({ type: "start", partial });
+				}, 0);
+				setTimeout(() => agent.steer(steering), 1);
 				setTimeout(
 					() => stream.push({ type: "done", reason: "stop", message: createAssistantMessage("done") }),
 					10,
