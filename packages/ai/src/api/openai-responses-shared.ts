@@ -340,6 +340,7 @@ export function convertResponsesMessages<TApi extends Api>(
 							call_id: callId,
 							name: toolCall.name,
 							arguments: JSON.stringify(toolCall.arguments),
+							...(toolCall.async ? { async: true } : {}),
 							...(isSameModel && toolCall.namespace !== undefined ? { namespace: toolCall.namespace } : {}),
 						});
 					}
@@ -510,6 +511,7 @@ export async function processResponsesStream<TApi extends Api>(
 				id: `${item.call_id}|${item.id}`,
 				name: item.name,
 				arguments: {},
+				...((item as { async?: boolean }).async ? { async: true } : {}),
 				...(item.namespace !== undefined ? { namespace: item.namespace } : {}),
 				partialJson: item.arguments || "",
 			};
@@ -531,6 +533,7 @@ export async function processResponsesStream<TApi extends Api>(
 				id: `${item.call_id}|${item.id}`,
 				name: item.name,
 				arguments: { [inputProperty]: input },
+				...((item as { async?: boolean }).async ? { async: true } : {}),
 				...(item.namespace !== undefined ? { namespace: item.namespace } : {}),
 				customInput: {
 					property: inputProperty,
@@ -735,6 +738,7 @@ export async function processResponsesStream<TApi extends Api>(
 				slot?.type === "toolCall" &&
 				slot.block.partialJson !== undefined
 			) {
+				if ((item as { async?: boolean }).async) slot.block.async = true;
 				slot.block.arguments = parseStreamingJson(item.arguments || slot.block.partialJson || "{}");
 				if (item.namespace !== undefined) slot.block.namespace = item.namespace;
 				// Finalize in-place and strip the scratch buffer so replay only
@@ -748,6 +752,7 @@ export async function processResponsesStream<TApi extends Api>(
 				});
 				outputSlots.delete(event.output_index);
 			} else if (item.type === "custom_tool_call" && slot?.type === "toolCall" && slot.block.customInput) {
+				if ((item as { async?: boolean }).async) slot.block.async = true;
 				pushToolCallDelta(
 					slot,
 					appendCustomToolCallInput(slot.block, item.input ?? getCustomToolCallInput(slot.block), true),

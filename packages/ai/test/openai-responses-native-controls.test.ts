@@ -8,21 +8,26 @@ import { normalizeContext, toToolDeclaration } from "../src/utils/transcript.ts"
 const capturedRequests: Record<string, unknown>[] = [];
 const fakeWSState = vi.hoisted(() => ({
 	instances: [] as unknown[],
-	mode: "steering" as "steering" | "pending" | "failed" | "async",
+	mode: "steering" as "steering" | "pending" | "failed" | "late-failed" | "cancelled" | "async" | "duplicate-steer",
 }));
 let responseIndex = 0;
 
 vi.mock("openai/resources/responses/ws", () => ({
 	ResponsesWS: class FakeResponsesWS {
 		sent: Record<string, unknown>[] = [];
+		socket = { readyState: 1 };
 		private releaseSteer!: () => void;
 		private resolveCreated!: () => void;
+		private resolveClosed!: () => void;
 		private streamCount = 0;
 		readonly steerReceived = new Promise<void>((resolve) => {
 			this.releaseSteer = resolve;
 		});
 		readonly created = new Promise<void>((resolve) => {
 			this.resolveCreated = resolve;
+		});
+		readonly closed = new Promise<void>((resolve) => {
+			this.resolveClosed = resolve;
 		});
 
 		constructor() {
@@ -34,9 +39,18 @@ vi.mock("openai/resources/responses/ws", () => ({
 			if (event.type === "response.steer") this.releaseSteer();
 		}
 
-		close() {}
+		close() {
+			this.socket.readyState = 3;
+			this.resolveClosed();
+		}
 
 		async *stream() {
+			if (fakeWSState.mode === "cancelled") {
+				yield { type: "message", message: { type: "response.created", response: { id: "response-cancelled" } } };
+				this.resolveCreated();
+				await this.closed;
+				return;
+			}
 			if (fakeWSState.mode === "failed") {
 				yield { type: "message", message: { type: "response.created", response: { id: "response-active" } } };
 				this.resolveCreated();
@@ -46,6 +60,37 @@ vi.mock("openai/resources/responses/ws", () => ({
 					type: "message",
 					message: { type: "response.completed", response: { id: "response-active", status: "completed" } },
 				};
+				return;
+			}
+			if (fakeWSState.mode === "duplicate-steer" && this.streamCount++ > 0) {
+				yield { type: "message", message: { type: "response.created", response: { id: "response-after-steer" } } };
+				yield {
+					type: "message",
+					message: { type: "response.completed", response: { id: "response-after-steer", status: "completed" } },
+				};
+				return;
+			}
+			if (fakeWSState.mode === "late-failed" && this.streamCount++ > 0) {
+				yield {
+					type: "message",
+					message: { type: "response.created", response: { id: "response-after-failure" } },
+				};
+				yield {
+					type: "message",
+					message: { type: "response.completed", response: { id: "response-after-failure", status: "completed" } },
+				};
+				return;
+			}
+			if (fakeWSState.mode === "late-failed") {
+				yield { type: "message", message: { type: "response.created", response: { id: "response-late-failure" } } };
+				this.resolveCreated();
+				await this.steerReceived;
+				yield { type: "message", message: { type: "response.steer.accepted", steer: { id: "steer-late" } } };
+				yield {
+					type: "message",
+					message: { type: "response.completed", response: { id: "response-late-failure", status: "completed" } },
+				};
+				yield { type: "message", message: { type: "response.steer.failed", steer: { id: "steer-late" } } };
 				return;
 			}
 			if (fakeWSState.mode === "pending" && this.streamCount++ > 0) {
@@ -63,7 +108,7 @@ vi.mock("openai/resources/responses/ws", () => ({
 				yield { type: "message", message: { type: "response.created", response: { id: "response-pending" } } };
 				this.resolveCreated();
 				await this.steerReceived;
-				yield { type: "message", message: { type: "response.steer.pending" } };
+				yield { type: "message", message: { type: "response.steer.accepted" } };
 				yield {
 					type: "message",
 					message: {
@@ -87,6 +132,7 @@ vi.mock("openai/resources/responses/ws", () => ({
 							type: "function_call",
 							id: "fc-pending",
 							call_id: "call-pending",
+							async: true,
 							name: "work",
 							arguments: "{}",
 						},
@@ -96,6 +142,7 @@ vi.mock("openai/resources/responses/ws", () => ({
 					type: "message",
 					message: { type: "response.completed", response: { id: "response-pending", status: "completed" } },
 				};
+				yield { type: "message", message: { type: "response.steer.pending" } };
 				return;
 			}
 			if (fakeWSState.mode === "async" && this.streamCount++ > 0) {
@@ -113,7 +160,14 @@ vi.mock("openai/resources/responses/ws", () => ({
 					message: {
 						type: "response.output_item.added",
 						output_index: 0,
-						item: { type: "function_call", id: "fc-async", call_id: "call-async", name: "work", arguments: "" },
+						item: {
+							type: "function_call",
+							id: "fc-async",
+							call_id: "call-async",
+							name: "work",
+							arguments: "",
+							async: true,
+						},
 					},
 				};
 				yield {
@@ -125,7 +179,14 @@ vi.mock("openai/resources/responses/ws", () => ({
 					message: {
 						type: "response.output_item.done",
 						output_index: 0,
-						item: { type: "function_call", id: "fc-async", call_id: "call-async", name: "work", arguments: "{}" },
+						item: {
+							type: "function_call",
+							id: "fc-async",
+							call_id: "call-async",
+							name: "work",
+							arguments: "{}",
+							async: true,
+						},
 					},
 				};
 				yield {
@@ -299,6 +360,57 @@ describe("OpenAI Responses native controls serialization", () => {
 		expect(fourthInput.filter((item) => item.type === "configuration_update").at(-1)?.reasoning?.effort).toBe("low");
 	});
 
+	it("establishes a new reasoning baseline for a model or context window", async () => {
+		capturedRequests.length = 0;
+		responseIndex = 0;
+		const model = createModel();
+		const user = { role: "user" as const, content: "start", timestamp: 1 };
+		const previousAssistant = await captureRequest(model, [user], "low");
+		const switchedModel = { ...model, id: "gpt-6-next" };
+		await captureRequest(switchedModel, [user, previousAssistant], "high");
+		await captureRequest(
+			model,
+			[
+				{
+					role: "user",
+					content: "compacted",
+					reasoningEffortBaseline: true,
+					timestamp: 4,
+				},
+				{ role: "user", content: "continue", timestamp: 5 },
+			],
+			"medium",
+		);
+
+		expect(capturedRequests.map((request) => (request.reasoning as { effort?: string }).effort)).toEqual([
+			"low",
+			"high",
+			"medium",
+		]);
+	});
+
+	it("keeps request-level effort behavior for models without update support", async () => {
+		capturedRequests.length = 0;
+		responseIndex = 0;
+		const model = { ...createModel(), compat: {} };
+		const user = { role: "user" as const, content: "start", timestamp: 1 };
+		const assistant = await captureRequest(model, [user], "low");
+		const next = await captureRequest(
+			model,
+			[user, assistant, { role: "system", content: "", reasoningEffortUpdate: "high", timestamp: 2 }],
+			"high",
+		);
+
+		expect(capturedRequests.map((request) => (request.reasoning as { effort?: string }).effort)).toEqual([
+			"low",
+			"high",
+		]);
+		expect(
+			(capturedRequests[1].input as Array<{ type?: string }>).some((item) => item.type === "configuration_update"),
+		).toBe(false);
+		expect(next.reasoningEffortBaseline).toBe("high");
+	});
+
 	it("steers an active response on the same WebSocket and follows its successor", async () => {
 		fakeWSState.instances.length = 0;
 		fakeWSState.mode = "steering";
@@ -336,6 +448,40 @@ describe("OpenAI Responses native controls serialization", () => {
 		expect(await response.result()).toMatchObject({ responseId: "response-successor", stopReason: "stop" });
 	});
 
+	it("removes only the accepted copy of repeated steering text during continuation", async () => {
+		fakeWSState.instances.length = 0;
+		fakeWSState.mode = "duplicate-steer";
+		const model = { ...createModel(), compat: { supportsNativeSteering: true } };
+		const initial = { role: "user" as const, content: "start", timestamp: 1 };
+		const steer = { role: "user" as const, content: "repeat this", timestamp: 2 };
+		const first = stream(model, normalizeContext({ messages: [initial] }), {
+			apiKey: "test",
+			sessionId: "duplicate-steer-test",
+		});
+		const completed = (async () => {
+			for await (const _event of first) {
+				// Drain the active response.
+			}
+		})();
+		await vi.waitFor(() => expect(fakeWSState.instances).toHaveLength(1));
+		const ws = fakeWSState.instances[0] as { created: Promise<void> };
+		await ws.created;
+		await expect(first.activeResponseController?.steer(steer)).resolves.toBe(true);
+		await completed;
+
+		const continuation = stream(
+			model,
+			normalizeContext({ messages: [initial, await first.result(), steer, { ...steer, timestamp: 3 }] }),
+			{ apiKey: "test", sessionId: "duplicate-steer-test" },
+		);
+		for await (const _event of continuation) {
+			// Drain the continuation.
+		}
+		const sent = (fakeWSState.instances[0] as { sent: Record<string, unknown>[] }).sent;
+		const request = sent[1] as { input: Array<{ content?: Array<{ text?: string }> }> };
+		expect(request.input.filter((item) => item.content?.some((part) => part.text === "repeat this"))).toHaveLength(1);
+	});
+
 	it("returns rejected steering so Pi can keep its queued fallback", async () => {
 		fakeWSState.instances.length = 0;
 		fakeWSState.mode = "failed";
@@ -358,6 +504,124 @@ describe("OpenAI Responses native controls serialization", () => {
 		).resolves.toBe(false);
 		await completed;
 		expect((await response.result()).stopReason).toBe("stop");
+	});
+
+	it("does not reuse a session WebSocket after API credentials change", async () => {
+		fakeWSState.instances.length = 0;
+		fakeWSState.mode = "async";
+		const model = { ...createModel(), compat: { supportsNativeSteering: true } };
+		const user = { role: "user" as const, content: "start", timestamp: 1 };
+		const first = stream(model, normalizeContext({ messages: [user] }), {
+			apiKey: "first-key",
+			sessionId: "credential-change-test",
+		});
+		for await (const _event of first) {
+			// Drain the first authenticated connection.
+		}
+		const second = stream(model, normalizeContext({ messages: [user, await first.result()] }), {
+			apiKey: "second-key",
+			sessionId: "credential-change-test",
+		});
+		for await (const _event of second) {
+			// Drain the replacement connection.
+		}
+
+		expect(fakeWSState.instances).toHaveLength(2);
+		const replacement = fakeWSState.instances[1] as { sent: Record<string, unknown>[] };
+		expect(replacement.sent[0]).not.toHaveProperty("previous_response_id");
+	});
+
+	it("replays full history after a cached WebSocket disconnects", async () => {
+		fakeWSState.instances.length = 0;
+		fakeWSState.mode = "async";
+		const model = { ...createModel(), compat: { supportsNativeSteering: true } };
+		const user = { role: "user" as const, content: "start", timestamp: 1 };
+		const first = stream(model, normalizeContext({ messages: [user] }), {
+			apiKey: "test",
+			sessionId: "disconnect-replay-test",
+		});
+		for await (const _event of first) {
+			// Drain the first response.
+		}
+		const original = fakeWSState.instances[0] as { socket: { readyState: number } };
+		original.socket.readyState = 3;
+		const second = stream(model, normalizeContext({ messages: [user, await first.result()] }), {
+			apiKey: "test",
+			sessionId: "disconnect-replay-test",
+		});
+		for await (const _event of second) {
+			// Drain the replacement response.
+		}
+
+		expect(fakeWSState.instances).toHaveLength(2);
+		const replacement = fakeWSState.instances[1] as { sent: Record<string, unknown>[] };
+		expect(replacement.sent[0]).not.toHaveProperty("previous_response_id");
+		expect(replacement.sent[0].input).toEqual(
+			expect.arrayContaining([
+				{ role: "user", content: [{ type: "input_text", text: "start" }] },
+				expect.objectContaining({ type: "function_call", call_id: "call-async", async: true }),
+			]),
+		);
+	});
+
+	it("closes an active WebSocket when the request is cancelled", async () => {
+		fakeWSState.instances.length = 0;
+		fakeWSState.mode = "cancelled";
+		const model = { ...createModel(), compat: { supportsNativeSteering: true } };
+		const abortController = new AbortController();
+		const response = stream(
+			model,
+			normalizeContext({ messages: [{ role: "user", content: "start", timestamp: 1 }] }),
+			{ apiKey: "test", sessionId: "cancelled-response-test", signal: abortController.signal },
+		);
+		const completed = (async () => {
+			for await (const _event of response) {
+				// Drain until cancellation closes the response.
+			}
+		})();
+		await vi.waitFor(() => expect(fakeWSState.instances).toHaveLength(1));
+		const ws = fakeWSState.instances[0] as { created: Promise<void> };
+		await ws.created;
+		abortController.abort();
+		await completed;
+
+		expect((await response.result()).stopReason).toBe("aborted");
+	});
+
+	it("replays a steer when the server later rejects an accepted steering event", async () => {
+		fakeWSState.instances.length = 0;
+		fakeWSState.mode = "late-failed";
+		const model = { ...createModel(), compat: { supportsNativeSteering: true } };
+		const user = { role: "user" as const, content: "start", timestamp: 1 };
+		const steer = { role: "user" as const, content: "keep the file unchanged", timestamp: 2 };
+		const first = stream(model, normalizeContext({ messages: [user] }), {
+			apiKey: "test",
+			sessionId: "late-failed-steer-test",
+		});
+		const firstEvents = (async () => {
+			for await (const _event of first) {
+				// Drain the original response and late failure event.
+			}
+		})();
+		await vi.waitFor(() => expect(fakeWSState.instances).toHaveLength(1));
+		const ws = fakeWSState.instances[0] as { sent: Record<string, unknown>[]; created: Promise<void> };
+		await ws.created;
+		await expect(first.activeResponseController?.steer(steer)).resolves.toBe(true);
+		await firstEvents;
+		const assistant = await first.result();
+		const next = stream(model, normalizeContext({ messages: [user, assistant, steer] }), {
+			apiKey: "test",
+			sessionId: "late-failed-steer-test",
+		});
+		for await (const _event of next) {
+			// Drain the continuation.
+		}
+
+		expect(ws.sent[2]).toMatchObject({
+			type: "response.create",
+			previous_response_id: "response-late-failure",
+			input: [{ role: "user", content: [{ type: "input_text", text: "keep the file unchanged" }] }],
+		});
 	});
 
 	it("accepts pending steering and sends only the tool result in its continuation", async () => {
@@ -440,7 +704,7 @@ describe("OpenAI Responses native controls serialization", () => {
 		for await (const event of first) firstEvents.push(event.type);
 		const assistant = await first.result();
 		const call = assistant.content.find((item) => item.type === "toolCall");
-		expect(call).toMatchObject({ id: "call-async|fc-async", name: "work" });
+		expect(call).toMatchObject({ id: "call-async|fc-async", name: "work", async: true });
 		expect(firstEvents.indexOf("toolcall_end")).toBeLessThan(firstEvents.indexOf("text_end"));
 
 		const second = stream(

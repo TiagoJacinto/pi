@@ -5,7 +5,7 @@ import type {
 	ResponseStreamEvent,
 	ResponsesClientEvent,
 } from "openai/resources/responses/responses.js";
-import type { ResponsesWS } from "openai/resources/responses/ws";
+import { ResponsesWS } from "openai/resources/responses/ws";
 import { clampThinkingLevel } from "../models.ts";
 import { registerSessionResourceCleanup } from "../session-resources.ts";
 import type {
@@ -100,7 +100,7 @@ function getReasoningEffortBaseline(
 	let pinnedEffort: OpenAIResponsesOptions["reasoningEffort"];
 	let baselineEstablished = false;
 	for (const message of context.messages) {
-		if (message.role === "system" && message.reasoningEffortBaseline) {
+		if ((message.role === "system" || message.role === "user") && message.reasoningEffortBaseline) {
 			pinnedEffort = selectedEffort;
 			baselineEstablished = true;
 		}
@@ -226,15 +226,18 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 					? `${options.sessionId}\0${model.provider}\0${model.id}\0${model.contextWindow}`
 					: undefined;
 				let session = cacheKey ? openAIResponsesWebSocketSessions.get(cacheKey) : undefined;
-				if (session && session.baseUrl !== model.baseUrl) {
-					closeResponsesWebSocket(session.connection, "model endpoint changed");
+				if (session && session.connection.socket.readyState > 1) {
+					openAIResponsesWebSocketSessions.delete(cacheKey!);
+					session = undefined;
+				} else if (session && (session.baseUrl !== model.baseUrl || session.apiKey !== apiKey)) {
+					closeResponsesWebSocket(session.connection, "request credentials changed");
 					openAIResponsesWebSocketSessions.delete(cacheKey!);
 					session = undefined;
 				}
 				if (!session) {
-					const { ResponsesWS } = await import("openai/resources/responses/ws");
 					session = {
 						connection: new ResponsesWS(client),
+						apiKey,
 						baseUrl: model.baseUrl,
 					};
 					if (cacheKey) openAIResponsesWebSocketSessions.set(cacheKey, session);
@@ -249,20 +252,27 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 						{ ...fullBody, input: (fullBody.input ?? []) as ResponseInput },
 						activeSession,
 					);
+					if (options?.signal?.aborted) throw new Error("Request was aborted");
 					activeSession.connection.send({ type: "response.create", ...requestBody } as ResponsesClientEvent);
-					await processResponsesStream(
-						responsesWebSocketEvents(activeSession.connection, steering.state, activeSession),
-						output,
-						stream,
-						model,
-						{
-							onProviderStreamEvent: options?.onProviderStreamEvent,
-							serviceTier: options?.serviceTier,
-							grammarToolInputProperties,
-							applyServiceTierPricing: (usage, serviceTier) =>
-								applyServiceTierPricing(usage, serviceTier, model),
-						},
-					);
+					const abortResponse = () => closeResponsesWebSocket(activeSession.connection, "request aborted");
+					options?.signal?.addEventListener("abort", abortResponse, { once: true });
+					try {
+						await processResponsesStream(
+							responsesWebSocketEvents(activeSession.connection, steering.state, activeSession),
+							output,
+							stream,
+							model,
+							{
+								onProviderStreamEvent: options?.onProviderStreamEvent,
+								serviceTier: options?.serviceTier,
+								grammarToolInputProperties,
+								applyServiceTierPricing: (usage, serviceTier) =>
+									applyServiceTierPricing(usage, serviceTier, model),
+							},
+						);
+					} finally {
+						options?.signal?.removeEventListener("abort", abortResponse);
+					}
 					activeSession.lastRequestBody = { ...fullBody, input: (fullBody.input ?? []) as ResponseInput };
 					activeSession.lastResponseId = output.responseId;
 					activeSession.lastResponseItems = convertResponsesMessages(
@@ -368,11 +378,12 @@ type OpenAIResponsesWebSocketRequest = Omit<
 
 type OpenAIResponsesWebSocketSession = {
 	connection: ResponsesWS;
+	apiKey: string;
 	baseUrl: string;
 	lastRequestBody?: OpenAIResponsesWebSocketRequest;
 	lastResponseId?: string;
 	lastResponseItems?: ResponseInput;
-	acceptedSteerInputs?: ResponseInput[];
+	acceptedSteerInputs?: Array<{ steerId?: string; input: ResponseInput }>;
 };
 
 const openAIResponsesWebSocketSessions = new Map<string, OpenAIResponsesWebSocketSession>();
@@ -427,14 +438,18 @@ function buildOpenAIResponsesWebSocketRequest(
 		return body;
 	}
 	const delta = body.input.slice(prefix.length);
-	const acceptedSteers = (session.acceptedSteerInputs ?? []).flatMap((input) =>
-		typeof input === "string" ? [] : input,
-	);
+	const continuationInput = [...delta];
+	for (const { input } of session.acceptedSteerInputs ?? []) {
+		for (const steer of input) {
+			const duplicateIndex = continuationInput.findIndex((item) => JSON.stringify(item) === JSON.stringify(steer));
+			if (duplicateIndex >= 0) continuationInput.splice(duplicateIndex, 1);
+		}
+	}
 	session.acceptedSteerInputs = [];
 	return {
 		...body,
 		previous_response_id: previousResponseId,
-		input: delta.filter((item) => !acceptedSteers.some((steer) => JSON.stringify(steer) === JSON.stringify(item))),
+		input: continuationInput,
 	};
 }
 
@@ -505,6 +520,7 @@ async function* responsesWebSocketEvents(
 	state: ResponsesSteeringState,
 	session: OpenAIResponsesWebSocketSession,
 ): AsyncGenerator<ResponseStreamEvent> {
+	let responseFinished = false;
 	try {
 		for await (const message of connection.stream()) {
 			if (message.type === "error") throw message.error;
@@ -512,27 +528,52 @@ async function* responsesWebSocketEvents(
 			const event = message.message as unknown as {
 				type: string;
 				response?: { id?: string; status?: string; incomplete_details?: { reason?: string } };
+				steer?: { id?: string; input?: ResponseInput };
 			};
 			if (event.type === "response.created" && event.response?.id) {
 				if (state.responseId && state.responseId !== event.response.id) state.acceptedSteers = 0;
 				state.responseId = event.response.id;
 				sendPendingSteers(connection, state);
-			} else if (event.type === "response.steer.accepted" || event.type === "response.steer.pending") {
+			} else if (event.type === "response.steer.accepted") {
 				state.acceptedSteers++;
-				if (event.type === "response.steer.pending") state.waitingForToolOutput = true;
 				const pending = state.pendingAcks.shift();
 				if (pending) {
 					pending.resolve(true);
 					session.acceptedSteerInputs ??= [];
-					session.acceptedSteerInputs.push(pending.input);
+					session.acceptedSteerInputs.push({ steerId: event.steer?.id, input: pending.input });
 				}
+			} else if (event.type === "response.steer.pending") {
+				state.waitingForToolOutput = true;
 			} else if (event.type === "response.steer.failed") {
-				state.pendingAcks.shift()?.resolve(false);
+				const acceptedIndex = session.acceptedSteerInputs?.findIndex((accepted) =>
+					event.steer?.id
+						? accepted.steerId === event.steer.id
+						: JSON.stringify(accepted.input) === JSON.stringify(event.steer?.input),
+				);
+				if (acceptedIndex !== undefined && acceptedIndex >= 0) {
+					session.acceptedSteerInputs?.splice(acceptedIndex, 1);
+					state.acceptedSteers = Math.max(0, state.acceptedSteers - 1);
+				}
+				const pendingIndex = event.steer?.input
+					? state.pendingAcks.findIndex(
+							(pending) => JSON.stringify(pending.input) === JSON.stringify(event.steer?.input),
+						)
+					: event.steer?.id
+						? -1
+						: 0;
+				if (pendingIndex >= 0) state.pendingAcks.splice(pendingIndex, 1)[0]?.resolve(false);
 			}
 			// SAFETY: WebSocket steering acknowledgements are Responses events not yet declared in the SDK event union.
 			yield message.message as ResponseStreamEvent;
 			if (event.type === "response.completed" || event.type === "response.incomplete") {
+				responseFinished = true;
 				if (state.waitingForToolOutput || state.acceptedSteers === 0) return;
+			} else if (event.type === "response.steer.pending" && responseFinished) {
+				// OpenAI reports pending required tool output after the original response terminal event.
+				// Return control to Pi so it can execute the tool and continue on this socket.
+				return;
+			} else if (event.type === "response.steer.failed" && responseFinished && state.acceptedSteers === 0) {
+				return;
 			}
 		}
 	} finally {
